@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>晏銘湛箴 · 量化研究</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="brand">晏銘湛箴</p>
+      <h1>多市場量化研究框架</h1>
+    </div>
+    <p class="stamp">紙上回測 · 不下單 · 槓桿上限 2 倍</p>
+  </header>
+  <main>
+    <section class="panel controls">
+      <h2>回測條件</h2>
+      <label>市場<select id="market"></select></label>
+      <label>來源<select id="source"></select></label>
+      <label>代碼<input id="symbol" value="BTC/USDT" /></label>
+      <label>週期<select id="timeframe"></select></label>
+      <div class="row">
+        <label>開始<input id="start" type="date" value="2026-01-01" /></label>
+        <label>結束<input id="end" type="date" value="2026-11-10" /></label>
+      </div>
+      <label>策略<select id="strategy"></select></label>
+      <p id="formula" class="note"></p>
+      <div id="params"></div>
+      <fieldset>
+        <legend>槓桿</legend>
+        <div id="leverage" class="choices"></div>
+      </fieldset>
+      <div class="row">
+        <label>本金<input id="capital" type="number" value="10" min="0" step="1" /></label>
+        <label>幣別<input id="currency" value="USDT" readonly /></label>
+      </div>
+      <div class="row">
+        <label>手續費 bp<input id="fee" type="number" value="10" min="0" step="0.1" /></label>
+        <label>滑點 bp<input id="slip" type="number" value="5" min="0" step="0.1" /></label>
+      </div>
+      <div class="row">
+        <label>量能衝擊<input id="impact" type="number" value="0" min="0" step="0.01" /></label>
+        <label>印花稅 bp<input id="stamp" type="number" value="0" min="0" step="0.1" /></label>
+      </div>
+      <div class="row">
+        <label>止盈比例<input id="tp" type="number" value="0.10" min="0" step="0.01" /></label>
+        <label>止損比例<input id="sl" type="number" value="0.05" min="0" step="0.01" /></label>
+      </div>
+      <label class="check"><input id="short" type="checkbox" /> 永續允許做空（現貨會被拒絕）</label>
+      <p id="market-note" class="note"></p>
+      <div class="actions">
+        <button id="run" type="button">執行回測</button>
+        <button id="save" type="button" class="ghost">儲存設定</button>
+        <button id="load" type="button" class="ghost">載入設定</button>
+      </div>
+    </section>
+    <section class="panel results">
+      <h2>結果</h2>
+      <p id="status" class="status">選擇條件後執行。資料來自分開的公開端點，失敗會停在錯誤，不會偷偷換來源。</p>
+      <div id="metrics" class="metrics"></div>
+      <canvas id="price" width="920" height="320"></canvas>
+      <canvas id="equity" width="920" height="180"></canvas>
+      <div class="table-wrap">
+        <table id="ledger">
+          <thead>
+            <tr><th>時間</th><th>動作</th><th>價格</th><th>數量</th><th>費用</th><th>原因</th><th>權益</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="prov" class="note"></p>
+    </section>
+    <section class="panel wallet">
+      <h2>公開錢包追蹤</h2>
+      <p class="note">只讀別人的公開地址。不連錢包、不收私鑰。轉帳不會被當成損益。</p>
+      <label>Solana 公開地址<input id="address" placeholder="貼上公開地址" /></label>
+      <button id="inspect" type="button">讀取鏈上活動</button>
+      <pre id="wallet-out" class="log"></pre>
+    </section>
+  </main>
+  <footer>晏銘湛箴 YMZZ · MIT · 研究框架，不是投資建議。GMGN 執行仍是未接上的介面。</footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
