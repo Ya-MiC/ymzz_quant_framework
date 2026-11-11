@@ -6,12 +6,17 @@
 
 **入金與 API（請先看這份）：** [Kraken 入金與 API 設定教程](docs/kraken_入金與API設定教程.md)。晏銘要自己為已開通的 Kraken 帳戶入金約 10 美元，並建立給 `python -m ymzz.cli paper`／`--live` 用的 API 金鑰時，照那份做。金鑰不要貼進對話、Issue、截圖或 Git。
 
+開源引擎與資料層怎麼取捨，見 [開源層級比較與取捨](docs/1111_1413_seoul_開源層級比較與取捨.md)。Nautilus 與 Lean 不放進這個倉庫。
+
 ## 安裝與執行
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+# 可選，不裝也不影響既有路徑：
+# pip install -e ".[polymarket]"
+# pip install -e ".[ccxt]"
 PYTHONPATH=src pytest
 PYTHONPATH=src python -m ymzz.examples
 PYTHONPATH=src python -m ymzz.api
@@ -151,7 +156,7 @@ ssh -L 8787:127.0.0.1:8787 user@server
 - 手續費、固定滑點（bp），以及可選的量能衝擊。沒有成交額又打開量能衝擊時，回測停止，不會自己估一個量。
 - 止盈與止損都設在成交價上。開盤價若已在兩側之間，而這根高低點兩邊都碰到，先止損。
 - 開盤已經跳空穿過某一側，用開盤價。
-- A 股一手 100 股，買進當天不做止盈止損（簡化的 T+1）。賣出另計印花稅，預設 5bp，這是參數。
+- A 股一手 100 股。買進那一根不能賣，這是日線上的 T+1；這版沒有把昨倉和今倉拆帳，當天若加倉，整筆都鎖到下一根。賣出另計印花稅，預設 5bp。漲停價不成交買單，跌停價不成交賣單，止損也一樣。幅度用前收：ST 5%，主板 10%，創業板（300、301）與科創板（688、689）20%。K 線標成停牌就不成交。來源沒有停牌旗標時，不會把成交量 0 猜成停牌。
 - 未平倉用最後收盤做市值，帳本上仍是持倉。
 
 加密預設本金 10 美元。貴州茅台一手遠高於這個數字，A 股預設 20 萬元；不夠一手就停止，不拆零股。
@@ -165,10 +170,10 @@ ssh -L 8787:127.0.0.1:8787 user@server
 | 市場 | 來源 | 說明 |
 | --- | --- | --- |
 | A 股日線 | 新浪、騰訊前復權、東財 `fqt=1` | 只有日線。新浪沒有復權參數，不稱作前復權。騰訊與東財的量是手，程式乘 100 成股。東財主機要明示，預設 `80.push2his.eastmoney.com`，不會輪詢。 |
-| BTC 現貨 | OKX、幣安、Kraken `BTC/USD` | OKX 日線切在 UTC+8。幣安與 Kraken 切在 UTC。Kraken 公開 OHLC 大約 720 根，未收盤與 `last` 之後的 K 線會剔除。不要混著比訊號。 |
-| BTC 永續 | OKX、幣安 | 必須同時拿到資金費。Kraken 這版沒有永續。 |
+| BTC 現貨 | OKX、幣安、Kraken `BTC/USD`，另有可選 ccxt | OKX 日線切在 UTC+8。幣安與 Kraken 切在 UTC。Kraken 公開 OHLC 大約 720 根，未收盤與 `last` 之後的 K 線會剔除。不要混著比訊號。ccxt 要另裝，並在請求帶 `ccxt_exchange`，不會改走那三個既有解析。 |
+| BTC 永續 | OKX、幣安 | 必須同時拿到資金費，而且幣安會帶 `startTime`／`endTime` 逐頁補齊。Kraken 這版沒有永續。ccxt 不接永續。 |
 | Solana 池 | GeckoTerminal 日線與 15 分 | 熱門池有生存者偏差。預設 30bp 是假設的池費。 |
-| Polymarket | Gamma 市場 + CLOB `prices-history` | 用 token id。歷史是價格點。HTTP 451 或空陣列就停止，不用現價編歷史。 |
+| Polymarket | 預設 Gamma + CLOB `prices-history` | 用 token id。歷史是價格點。HTTP 451 或空陣列就停止，不用現價編歷史。`adapter=sdk` 會試官方 `polymarket-client`（MIT，beta）；沒裝就退回 httpx。 |
 | Stock App 打金狗 | 無 | 產品還沒被指認。不接 yfinance，也不用 A 股或 GMGN 頂替。 |
 
 公開端點有頻率限制。幣安看 weight，OKX、Gecko、Solana 公共 RPC 都容易被限流。程式每次請求至少隔 0.25 秒（Solana 路徑 0.4 秒）。慢可以，假資料不行。
@@ -181,7 +186,7 @@ ssh -L 8787:127.0.0.1:8787 user@server
 
 ## 授權邊界
 
-見 [NOTICE.md](NOTICE.md)。可以依賴的 MIT 專案包含 ccxt、akshare、pandas-ta-classic、ta、aiogram、solana-py、Polymarket py-sdk。這版實際安裝並呼叫的是 aiogram；行情用 HTTP，所以離線測試不必拉整包 SDK。
+見 [NOTICE.md](NOTICE.md) 與 [開源層級比較](docs/1111_1413_seoul_開源層級比較與取捨.md)。可以依賴的 MIT 專案包含 ccxt、akshare、pandas-ta-classic、ta、aiogram、solana-py、Polymarket py-sdk（PyPI 套件名 `polymarket-client`）。預設安裝並呼叫的是 aiogram。ccxt 與 polymarket-client 是可選額外依賴，沒裝就用既有 HTTP。週期類參數必須是整數，14.9 不會被截成 14。止盈或止損之後，若目標曝險沒變，預設要等訊號改向才再進場。
 
 freqtrade、backtesting.py、vectorbt、python-telegram-bot 只可當對照，原始碼沒有進這個倉庫。
 

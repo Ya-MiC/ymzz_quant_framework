@@ -2,7 +2,7 @@
 
 本倉庫程式（回測引擎、指標、策略規則、資料適配器、網頁）是晏銘湛箴的原創實作，授權為 MIT。撰寫時沒有把下列專案的原始碼複製進這個倉庫。
 
-下面的提交是 2026-11-10 以 GitHub commits API 讀到的版本，用來標明「允許依賴或只作對照」的對象，不是代表本倉庫販售了它們的程式。
+下面兩次核對都用 GitHub commits API。2026-11-10 那張表標明當時允許依賴的對象。2026-11-11 14:13 KST 又對過一輪，數字在文末。這不是把那些專案的程式賣進本倉庫。
 
 ## 這版實際依賴
 
@@ -12,7 +12,7 @@
 
 其餘執行期依賴是 NumPy、pandas、httpx、FastAPI、Uvicorn、Pydantic、pytest，授權為 BSD 或 MIT，與本專案的 MIT 授權相容。
 
-紙上單不把 kraken-cli 的原始碼包進來。指令列呼叫本機已安裝的 `kraken`（[krakenfx/kraken-cli](https://github.com/krakenfx/kraken-cli)，MIT）：`kraken paper buy`、`kraken paper sell`、`kraken paper status`。沒有安裝時，紙上步驟會報錯，不會改成自己撮合。
+紙上單不把 kraken-cli 的原始碼包進來。本機若有 `kraken`（[krakenfx/kraken-cli](https://github.com/krakenfx/kraken-cli)，MIT），紙上步驟會呼叫 `kraken paper buy`、`kraken paper sell`、`kraken paper status`。沒有這個指令時，用紙上行情與手續費、滑點自己算成交，實盤不會改走這條模擬。
 
 ## 允許依賴、但這版沒有匯入它們的原始碼
 
@@ -42,6 +42,13 @@
 - backtesting.py：AGPL-3.0，https://github.com/kernc/backtesting.py
 - vectorbt、pybroker：Commons Clause
 - python-telegram-bot：LGPL-3.0-only。Telegram 改走 aiogram
-- nautilus_trader、backtrader：LGPL 或 GPL
+- nautilus_trader：LGPL-3.0。不內嵌，也不當依賴。研究用的 K 線與訊號可以匯出 CSV，在另一個環境交給 Nautilus 自己讀。
+- backtrader：GPL。不採用。
 
-Apache-2.0 的 hummingbot、Lean 只作概念對照，這版沒有依賴。
+Apache-2.0 的 hummingbot、QuantConnect Lean 只作概念對照。Lean 可以在另一個環境讀同一份 CSV，這個倉庫不內嵌它。
+
+可選額外依賴（不在預設 `pip install`）：`polymarket-client`（官方 py-sdk，MIT，上游標 beta）與 `ccxt`（MIT）。沒裝時，Polymarket 退回既有 httpx，ccxt 這個來源會直接說明沒有安裝，不會改接 okx、binance 或 kraken。
+
+## 2026-11-11 14:13 KST 再核對
+
+同一天的取捨寫在 `docs/1111_1413_seoul_開源層級比較與取捨.md`。這裡只留和授權邊界有關的結論：AKQuant、akshare、VeighNa、Jesse、Condor、Kelows/million、CabalSpy 的 Python SDK 都是 MIT，這版都沒有把它們的原始碼複製進來，也沒有把它們加進預設依賴。freqtrade 是 GPL-3.0，backtesting.py 是 AGPL-3.0，vectorbt 是 Apache-2.0 加 Commons Clause，只作對照。Polymarket 舊的 `py-clob-client` 倉庫已封存。

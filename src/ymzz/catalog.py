@@ -7,7 +7,7 @@ CATALOG = [
         "id": "crypto_spot",
         "label_zh": "加密現貨",
         "instrument": "spot",
-        "sources": ["okx", "binance", "kraken"],
+        "sources": ["okx", "binance", "kraken", "ccxt"],
         "default_source": "okx",
         "symbols": ["BTC/USDT", "BTC/USD", "ETH/USDT"],
         "timeframes": ["1d", "4h", "1h", "15m"],
@@ -15,7 +15,7 @@ CATALOG = [
         "currency": "USDT",
         "default_capital": 10,
         "default_fee_bps": 10,
-        "note_zh": "現貨槓桿固定 1。10 美元是預設研究本金，可以改。",
+        "note_zh": "現貨槓桿固定 1。10 美元是預設研究本金，可以改。ccxt 是可選來源，要另裝 ccxt 並帶 ccxt_exchange，不會取代 okx、binance、kraken。",
     },
     {
         "id": "crypto_perp",
@@ -45,7 +45,7 @@ CATALOG = [
         "default_fee_bps": 2.5,
         "default_stamp_tax_bps": 5,
         "lot_size": 100,
-        "note_zh": "只有日線。一手 100 股。茅台一手遠高於 10 美元，本金不足會明示，不會用零股或 yfinance 代替。",
+        "note_zh": "只有日線。一手 100 股。買進那根不能賣（T+1）。漲停不買、跌停不賣；ST 5%，創業板與科創板 20%，主板 10%。停牌日不成交。茅台一手遠高於 10 美元，本金不足會明示，不會用零股或 yfinance 代替。",
     },
     {
         "id": "solana_pool",
@@ -73,7 +73,7 @@ CATALOG = [
         "currency": "USDC",
         "default_capital": 10,
         "default_fee_bps": 0,
-        "note_zh": "Gamma 找市場，CLOB prices-history 才有歷史。歷史是成交價點，不是 K 線高低。被 451 擋住就停止，不編價格。",
+        "note_zh": "預設仍是 Gamma 與 CLOB prices-history（httpx）。可選 adapter=sdk 會試官方 polymarket-client（MIT，beta）；沒裝就退回 httpx。歷史是成交價點，不是 K 線高低。被 451 擋住就停止，不編價格。",
     },
     {
         "id": "stock_app",

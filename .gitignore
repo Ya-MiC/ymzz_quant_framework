@@ -10,3 +10,5 @@ data/live/
 data/runner/
 data/dashboard/
 .mypy_cache/
+build/
+*.egg-info/

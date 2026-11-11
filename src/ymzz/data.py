@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from ymzz.catalog import get_market
-from ymzz.engine import Bar, Funding
+from ymzz.engine import Bar, Funding, apply_ashare_limits, ashare_price_limit_rate
 from ymzz.errors import ConfigError, DataGapError, DataSourceError, StockAppUnidentified
 from ymzz.http_cache import DataClient
 from ymzz.timeutil import CST, UTC, ensure_utc
@@ -213,6 +213,44 @@ def parse_binance_funding(payload) -> list[Funding]:
     return [Funding(_dt_ms(int(row["fundingTime"])), float(row["fundingRate"])) for row in payload]
 
 
+def paginate_binance_funding(fetch, start_ms: int, end_ms: int, limit: int = 1000, max_pages: int = 20):
+    """fetch(params) 必須帶 startTime 與 endTime。不帶時間時幣安只回最近約 200 筆。"""
+    start_ms = int(start_ms)
+    end_ms = int(end_ms)
+    if start_ms > end_ms:
+        return [], False
+    cursor = start_ms
+    rows: list[dict] = []
+    seen: set[int] = set()
+    incomplete = False
+    for _ in range(max_pages):
+        params = {"startTime": str(cursor), "endTime": str(end_ms), "limit": str(limit)}
+        batch = fetch(params) or []
+        if isinstance(batch, dict):
+            raise DataSourceError(f"幣安資金費失敗：{batch.get('msg') or batch}。不會改用 OKX 的資金費。")
+        if not batch:
+            break
+        for row in batch:
+            ts = int(row["fundingTime"])
+            if ts in seen or ts < start_ms or ts > end_ms:
+                continue
+            seen.add(ts)
+            rows.append(row)
+        last = max(int(row["fundingTime"]) for row in batch)
+        if len(batch) < limit:
+            break
+        nxt = last + 1
+        if nxt <= cursor or nxt > end_ms:
+            incomplete = last < end_ms
+            break
+        cursor = nxt
+    else:
+        if not rows or max(int(row["fundingTime"]) for row in rows) < end_ms:
+            incomplete = True
+    rows.sort(key=lambda row: int(row["fundingTime"]))
+    return rows, incomplete
+
+
 def parse_kraken_ohlc(payload, timeframe: str, now: datetime) -> tuple[list[Bar], dict]:
     if payload.get("error"):
         raise DataSourceError(f"Kraken 錯誤：{payload.get('error')}")
@@ -415,13 +453,13 @@ def load_market(spec: dict, client: DataClient, now: datetime | None = None):
     elif market in {"crypto_spot", "crypto_perp"}:
         instrument = "perpetual" if market == "crypto_perp" else "spot"
         bars, funding, extra, prov = _load_crypto(
-            source, spec["symbol"], timeframe, instrument, start, end, client, now, mode
+            source, spec["symbol"], timeframe, instrument, start, end, client, now, mode, spec.get("ccxt_exchange")
         )
     elif market == "solana_pool":
         bars, extra, prov = _load_gecko(spec["symbol"], timeframe, start, end, client, now, mode)
         funding = []
     elif market == "polymarket":
-        bars, extra, prov = _load_polymarket(spec["symbol"], start, end, client, now, mode)
+        bars, extra, prov = _load_polymarket(spec["symbol"], start, end, client, now, mode, spec.get("adapter"))
         funding = []
     else:
         raise ConfigError(f"沒有這個市場：{market}")
@@ -448,13 +486,13 @@ def _load_ashare(source, symbol, start, end, client: DataClient, now, mode, host
         params = {"symbol": f"{prefix}{code}", "scale": "240", "ma": "no", "datalen": str(limit)}
         payload, prov = client.get_json(url, params, mode=mode, headers={"Referer": "https://finance.sina.com.cn"})
         bars, extra = parse_sina(payload, now)
-        return bars, extra, prov
+        return _stamp_ashare(code, symbol, bars, extra), extra, prov
     if source == "tencent":
         url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
         params = {"param": f"{prefix}{code},day,,,{limit},qfq"}
         payload, prov = client.get_json(url, params, mode=mode)
         bars, extra = parse_tencent(payload, f"{prefix}{code}", now)
-        return bars, extra, prov
+        return _stamp_ashare(code, symbol, bars, extra), extra, prov
     if source == "eastmoney":
         host = host or "80.push2his.eastmoney.com"
         allowed = {"80.push2his.eastmoney.com", "92.push2his.eastmoney.com", "push2his.eastmoney.com"}
@@ -474,8 +512,19 @@ def _load_ashare(source, symbol, start, end, client: DataClient, now, mode, host
         payload, prov = client.get_json(url, params, mode=mode, headers={"User-Agent": "Mozilla/5.0"})
         bars, extra = parse_eastmoney(payload, now)
         extra["host"] = host
-        return bars, extra, prov
+        return _stamp_ashare(code, symbol, bars, extra), extra, prov
     raise ConfigError(f"沒有這個 A 股來源：{source}")
+
+
+def _stamp_ashare(code: str, symbol: str, bars: list[Bar], extra: dict) -> list[Bar]:
+    rate = ashare_price_limit_rate(code, st="ST" in symbol.upper())
+    apply_ashare_limits(bars, rate)
+    extra["limit_rate"] = rate
+    extra["note_zh"] = extra.get("note_zh", "") + (
+        f" 漲跌停依前收計算，幅度 {rate:.0%}（ST 5%，創業板 300/301 與科創板 688/689 為 20%，其餘主板 10%）。"
+        "買進不越過漲停、賣出不越過跌停。停牌日要標 suspended 才不會成交；來源沒有這面旗標時，不把成交量 0 猜成停牌。"
+    )
+    return bars
 
 
 def _paginate(fetch_page, newest_first_ts):
@@ -495,7 +544,7 @@ def _paginate(fetch_page, newest_first_ts):
     return rows
 
 
-def _load_crypto(source, symbol, timeframe, instrument, start, end, client: DataClient, now, mode):
+def _load_crypto(source, symbol, timeframe, instrument, start, end, client: DataClient, now, mode, ccxt_exchange=None):
     base, quote = _split_symbol(symbol)
     if source == "kraken":
         if instrument != "spot":
@@ -567,17 +616,39 @@ def _load_crypto(source, symbol, timeframe, instrument, start, end, client: Data
         bars, extra = parse_binance_klines(payload, timeframe, now)
         funding = []
         if instrument == "perpetual":
-            fund_payload, fund_prov = client.get_json(
-                "https://fapi.binance.com/fapi/v1/fundingRate",
-                {"symbol": pair, "limit": "1000"},
-                mode=mode,
-            )
-            funding = parse_binance_funding(fund_payload)
+            if not bars:
+                raise DataSourceError("幣安永續沒有已收盤 K 線，無法決定資金費區間。")
+            start_ms = int(bars[0].open_time.timestamp() * 1000)
+            end_ms = int(bars[-1].close_time.timestamp() * 1000)
+
+            def fetch_funding(params):
+                payload, prov = client.get_json(
+                    "https://fapi.binance.com/fapi/v1/fundingRate",
+                    {"symbol": pair, **params},
+                    mode=mode,
+                )
+                fetch_funding.prov = prov
+                return payload
+
+            fetch_funding.prov = {}
+            rows, incomplete = paginate_binance_funding(fetch_funding, start_ms, end_ms)
+            funding = parse_binance_funding(rows)
             if not funding:
-                raise DataSourceError("幣安永續沒有資金費，已停止。")
-            extra["funding_sha256"] = fund_prov["sha256"]
+                raise DataSourceError("幣安永續沒有資金費，已停止。不會只拿最近一頁把較早的資金費漏掉。")
+            extra["funding_sha256"] = fetch_funding.prov.get("sha256")
             extra["funding_points"] = len(funding)
+            short_history = funding[0].time > bars[0].open_time + DURATION[timeframe]
+            if incomplete or short_history:
+                extra["funding_gap"] = True
+                extra["note_zh"] = extra.get("note_zh", "") + " 資金費沒有蓋滿這段 K 線。較早的持倉沒有被填 0，只是沒有事件可扣。"
         return bars, funding, extra, prov
+    if source == "ccxt":
+        from ymzz.ccxt_adapter import load_ccxt_bars
+
+        if instrument != "spot":
+            raise ConfigError("ccxt 可選適配器這版只接現貨 K 線。永續仍走 okx 或 binance，以免漏掉資金費。")
+        bars, extra = load_ccxt_bars(ccxt_exchange, symbol, timeframe, now)
+        return bars, [], extra, {"source": "ccxt", "exchange": ccxt_exchange}
     raise ConfigError(f"沒有這個加密來源：{source}")
 
 
@@ -592,7 +663,27 @@ def _load_gecko(pool: str, timeframe: str, start, end, client: DataClient, now, 
     return bars, extra, prov
 
 
-def _load_polymarket(symbol: str, start, end, client: DataClient, now, mode):
+def _load_polymarket(symbol: str, start, end, client: DataClient, now, mode, adapter=None):
+    if adapter == "sdk":
+        from ymzz.polymarket_sdk import SdkUnavailable, load_public_history
+
+        try:
+            history, meta = load_public_history(symbol)
+        except SdkUnavailable:
+            bars, extra, prov = _load_polymarket_httpx(symbol, client, now, mode)
+            extra["adapter"] = "httpx-fallback"
+            extra["beta"] = True
+            extra["note_zh"] = extra.get("note_zh", "") + " 官方 SDK（polymarket-client，MIT，beta）沒有安裝，已改走既有 httpx。沒有用私鑰。"
+            return bars, extra, prov
+        bars, extra = parse_polymarket_history(history, now)
+        extra.update(meta)
+        extra["beta"] = True
+        extra["note_zh"] = extra.get("note_zh", "") + " 這次走官方 polymarket-client（MIT，beta）。只讀公開市場與歷史價，沒有用私鑰。"
+        return bars, extra, {"source": "polymarket-sdk", "beta": True, "sha256": None}
+    return _load_polymarket_httpx(symbol, client, now, mode)
+
+
+def _load_polymarket_httpx(symbol: str, client: DataClient, now, mode):
     gamma_url = "https://gamma-api.polymarket.com/markets"
     if symbol.isdigit():
         payload, gamma_prov = client.get_json(f"https://gamma-api.polymarket.com/markets/{symbol}", mode=mode)

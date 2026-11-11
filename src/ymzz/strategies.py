@@ -180,7 +180,7 @@ STRATEGIES: dict[str, StrategySpec] = {
         decision_indicators=["rsi"],
         display_indicators=["rsi"],
         params=[
-            _p("period", "RSI 週期", 14, 2, 200, "決策只用這一條。"),
+            _p("period", "RSI 週期", 14, 2, 200, "決策只用這一條。", type_="int"),
             _p("oversold", "超賣線", 30, 1, 49),
             _p("overbought", "超買線", 70, 51, 99),
         ],
@@ -198,9 +198,9 @@ STRATEGIES: dict[str, StrategySpec] = {
         decision_indicators=["rsi_short", "rsi_mid", "rsi_long"],
         display_indicators=["rsi_short", "rsi_mid", "rsi_long"],
         params=[
-            _p("rsi_short", "短週期（觸發線）", 6, 2, 200, "上穿或下穿中線的是這一條。"),
-            _p("rsi_mid", "中週期（被穿越）", 12, 2, 300),
-            _p("rsi_long", "長週期（濾網）", 24, 2, 400, "金叉時短線必須高於這一條。"),
+            _p("rsi_short", "短週期（觸發線）", 6, 2, 200, "上穿或下穿中線的是這一條。", type_="int"),
+            _p("rsi_mid", "中週期（被穿越）", 12, 2, 300, type_="int"),
+            _p("rsi_long", "長週期（濾網）", 24, 2, 400, "金叉時短線必須高於這一條。", type_="int"),
         ],
     ),
     "macd": StrategySpec(
@@ -212,9 +212,9 @@ STRATEGIES: dict[str, StrategySpec] = {
         decision_indicators=["dif", "dea"],
         display_indicators=["dif", "dea", "macd_hist"],
         params=[
-            _p("fast", "快線", 12, 2, 100),
-            _p("slow", "慢線", 26, 3, 300),
-            _p("signal", "訊號線", 9, 2, 100),
+            _p("fast", "快線", 12, 2, 100, type_="int"),
+            _p("slow", "慢線", 26, 3, 300, type_="int"),
+            _p("signal", "訊號線", 9, 2, 100, type_="int"),
         ],
     ),
     "bollinger": StrategySpec(
@@ -226,7 +226,7 @@ STRATEGIES: dict[str, StrategySpec] = {
         decision_indicators=["bb_lower", "bb_mid"],
         display_indicators=["bb_mid", "bb_upper", "bb_lower"],
         params=[
-            _p("period", "週期", 20, 5, 200),
+            _p("period", "週期", 20, 5, 200, type_="int"),
             _p("mult", "倍數", 2, 0.5, 4),
         ],
     ),
@@ -239,8 +239,8 @@ STRATEGIES: dict[str, StrategySpec] = {
         decision_indicators=["ma_fast", "ma_slow"],
         display_indicators=["ma_fast", "ma_slow"],
         params=[
-            _p("fast", "快線", 5, 2, 120),
-            _p("slow", "慢線", 20, 3, 400),
+            _p("fast", "快線", 5, 2, 120, type_="int"),
+            _p("slow", "慢線", 20, 3, 400, type_="int"),
         ],
     ),
     "grid": StrategySpec(
@@ -258,7 +258,7 @@ STRATEGIES: dict[str, StrategySpec] = {
             _p("grid_lower", "下界（0 表示自動）", 0, 0, None, "0 則用第一根收盤 × (1−幅度)。"),
             _p("grid_upper", "上界（0 表示自動）", 0, 0, None, "0 則用第一根收盤 × (1+幅度)。"),
             _p("grid_span", "自動幅度", 0.10, 0.01, 0.5, "只有上下界為 0 時使用。"),
-            _p("n_grids", "格數", 5, 2, 20),
+            _p("n_grids", "格數", 5, 2, 20, type_="int"),
         ],
     ),
     "rsi_macd": StrategySpec(
@@ -275,13 +275,13 @@ STRATEGIES: dict[str, StrategySpec] = {
         decision_indicators=["rsi", "dif", "dea"],
         display_indicators=["rsi", "dif", "dea", "macd_hist"],
         params=[
-            _p("rsi_period", "RSI 週期", 14, 2, 200),
+            _p("rsi_period", "RSI 週期", 14, 2, 200, type_="int"),
             _p("rsi_low", "RSI 進場下緣", 40, 1, 98, "金叉當根 RSI 必須大於等於這一條。"),
             _p("rsi_high", "RSI 進場上緣", 70, 2, 99, "金叉當根 RSI 必須小於等於這一條。"),
             _p("rsi_exit", "RSI 出場", 75, 3, 99, "收盤高於這一條就出場。"),
-            _p("macd_fast", "MACD 快線", 12, 2, 100),
-            _p("macd_slow", "MACD 慢線", 26, 3, 300),
-            _p("macd_signal", "MACD 訊號", 9, 2, 100),
+            _p("macd_fast", "MACD 快線", 12, 2, 100, type_="int"),
+            _p("macd_slow", "MACD 慢線", 26, 3, 300, type_="int"),
+            _p("macd_signal", "MACD 訊號", 9, 2, 100, type_="int"),
         ],
     ),
 }
@@ -308,6 +308,10 @@ def _num(params: dict, key: str, spec: ParamSpec) -> float:
         raise ConfigError(f"{spec.label_zh} 不能小於 {spec.min}")
     if spec.max is not None and value > spec.max:
         raise ConfigError(f"{spec.label_zh} 不能大於 {spec.max}")
+    if spec.type == "int" and abs(value - round(value)) > 1e-9:
+        raise ConfigError(f"{spec.label_zh} 必須是整數，收到 {raw}。不會把 {value} 截成 {int(value)}。")
+    if spec.type == "int":
+        return float(int(round(value)))
     return value
 
 

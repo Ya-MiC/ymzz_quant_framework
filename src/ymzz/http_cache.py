@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -14,6 +15,7 @@ from ymzz.errors import CacheMissError, DataSourceError
 from ymzz.timeutil import now_utc, stamp_pair
 
 _LAST_HIT: dict[str, float] = {}
+_PACE_LOCK = threading.Lock()
 
 
 def _host(url: str) -> str:
@@ -41,6 +43,7 @@ class DataClient:
         http: httpx.Client | None = None,
         min_interval: float = 0.25,
         sleeper=None,
+        clock=None,
     ):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -51,6 +54,7 @@ class DataClient:
         )
         self.min_interval = min_interval
         self.sleeper = sleeper if sleeper is not None else time.sleep
+        self.clock = clock or time.monotonic
 
     def _path(self, key: str) -> Path:
         return self.cache_dir / f"{key}.json"
@@ -77,11 +81,15 @@ class DataClient:
             raise DataSourceError("資料模式只能是 live 或 cache")
         if pace:
             host = _host(url)
-            last = _LAST_HIT.get(host, 0.0)
-            wait = self.min_interval - (time.monotonic() - last)
+            with _PACE_LOCK:
+                now_m = self.clock()
+                earliest = _LAST_HIT.get(host, 0.0)
+                start_at = now_m if now_m >= earliest else earliest
+                wait = start_at - now_m
+                # 先佔住下一個名額，另一個執行緒才不會讀到同一個上次時間。
+                _LAST_HIT[host] = start_at + self.min_interval
             if wait > 0:
                 self.sleeper(wait)
-            _LAST_HIT[host] = time.monotonic()
         try:
             response = self.http.request(method, url, params=params, json=json_body, headers=headers)
             body = response.content

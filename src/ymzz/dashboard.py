@@ -17,6 +17,7 @@ from ymzz.forecast import describe_forecast
 from ymzz.http_cache import DataClient
 from ymzz.kraken_private import snapshot_private
 from ymzz.redact import redact
+from ymzz.paths import web_dir
 from ymzz.watch import add_watch_address, fetch_balances, load_watchlist
 
 
@@ -153,9 +154,7 @@ def status_view(root: Path) -> dict:
 def create_dashboard_app(root: Path | None = None, *, live_reader=None, balance_reader=None, backtest_runner=None, closes_loader=None) -> FastAPI:
     root = root or project_root()
     app = FastAPI(title="晏銘湛箴多端儀表臺", version="0.1.0")
-    web = project_root() / "web"
-    if not (web / "dashboard.html").exists():
-        web = root / "web"
+    web = web_dir()
 
     @app.exception_handler(YmzzError)
     async def on_error(_request, exc: YmzzError):

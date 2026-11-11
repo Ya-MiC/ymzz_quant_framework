@@ -48,7 +48,7 @@ function renderParams() {
     input.value = param.default;
     if (param.min != null) input.min = param.min;
     if (param.max != null) input.max = param.max;
-    input.step = "any";
+    input.step = param.type === "int" ? "1" : "any";
     label.appendChild(input);
     box.appendChild(label);
   });

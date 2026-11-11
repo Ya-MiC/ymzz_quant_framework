@@ -17,6 +17,7 @@ from ymzz.engine import CostConfig, EngineConfig, run_backtest
 from ymzz.errors import ConfigError, LeverageError, StockAppUnidentified, YmzzError
 from ymzz.http_cache import DataClient
 from ymzz.strategies import compute_signals, list_strategies
+from ymzz.paths import web_dir
 from ymzz.wallet import inspect_address, replay_swaps
 
 
@@ -57,6 +58,9 @@ class BacktestIn(BaseModel):
     source_host: str | None = None
     data_mode: str = "live"
     position_frac: float = 1.0
+    adapter: str | None = None
+    ccxt_exchange: str | None = None
+    entry_trigger: str = "edge"
     daily_loss_halt_pct: float | None = None
     ordermin: float | None = None
     costmin: float | None = None
@@ -88,7 +92,7 @@ def _root() -> Path:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="晏銘湛箴量化研究", version="0.1.0")
-    web = _root() / "web"
+    web = web_dir()
     if web.exists():
         app.mount("/static", StaticFiles(directory=web), name="static")
 
@@ -173,6 +177,8 @@ def create_app() -> FastAPI:
                 mmr=body.mmr,
                 lot_size=float(market.get("lot_size") or 0),
                 intrabar_exit_on_entry=body.market != "ashare",
+                t_plus_one=body.market == "ashare",
+                entry_trigger=body.entry_trigger,
                 allow_short=body.allow_short and instrument == "perpetual",
                 position_frac=body.position_frac,
                 daily_loss_halt_pct=halt,

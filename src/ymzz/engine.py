@@ -65,6 +65,9 @@ class Bar:
     volume: float | None = None
     quote_volume: float | None = None
     closed: bool = True
+    suspended: bool = False
+    limit_up: float | None = None
+    limit_down: float | None = None
 
 
 @dataclass
@@ -91,6 +94,8 @@ class EngineConfig:
     costmin: float = 0.0
     lot_decimals: int | None = None
     signal_mode: str = "target"
+    entry_trigger: str = "edge"
+    t_plus_one: bool = False
 
     def validated(self) -> "EngineConfig":
         self.leverage = enforce_leverage(self.leverage, self.instrument)
@@ -117,6 +122,8 @@ class EngineConfig:
             raise ConfigError("數量小數位不能是負數")
         if self.signal_mode not in {"target", "pulse"}:
             raise ConfigError("訊號模式只能是 target 或 pulse")
+        if self.entry_trigger not in {"edge", "level"}:
+            raise ConfigError("進場觸發只能是 edge（等新的交叉）或 level（舊的持倉目標還在就再進）")
         return self
 
 
@@ -135,6 +142,41 @@ def fill_price(raw: float, side: int, slip_bps: float) -> float:
     if side > 0:
         return raw * (1.0 + rate)
     return raw * (1.0 - rate)
+
+
+def ashare_price_limit_rate(symbol: str, *, st: bool = False) -> float:
+    """ST 5%、創業板 300/301 與科創板 688/689 為 20%、其餘主板 10%。只依代碼，不打網路。"""
+    code = "".join(ch for ch in symbol if ch.isdigit())
+    if st or "ST" in symbol.upper():
+        return 0.05
+    if code.startswith(("300", "301", "688", "689")):
+        return 0.20
+    return 0.10
+
+
+def apply_ashare_limits(bars: list[Bar], rate: float) -> None:
+    """用前一交易日收盤標漲停與跌停。停牌日不更新基準收盤。"""
+    if rate <= 0 or rate >= 0.5:
+        raise ConfigError("漲跌停幅度必須在 0 與 50% 之間")
+    prev: float | None = None
+    for bar in bars:
+        if prev is not None:
+            bar.limit_up = round(prev * (1.0 + rate) + 1e-8, 2)
+            bar.limit_down = round(prev * (1.0 - rate) + 1e-8, 2)
+        if not bar.suspended:
+            prev = bar.close
+
+
+def limit_block(bar: Bar, side: int, raw: float, slip_bps: float) -> str | None:
+    """漲停不能買、跌停不能賣。比較的是含滑點的成交價，避免滑點把單子送過板價。"""
+    if bar.limit_up is None and bar.limit_down is None:
+        return None
+    price = fill_price(raw, side, slip_bps)
+    if side > 0 and bar.limit_up is not None and price >= bar.limit_up - 1e-8:
+        return "limit_up"
+    if side < 0 and bar.limit_down is not None and price <= bar.limit_down + 1e-8:
+        return "limit_down"
+    return None
 
 
 def floor_qty(qty: float, decimals: int) -> float:
@@ -315,6 +357,8 @@ def run_backtest(
     fund_idx = 0
     entry_state: dict | None = None
     pending_pulse = False
+    reentry_block: float | None = None
+    edge_noted = False
     sod_date = None
     sod_equity = wallet
     halted = False
@@ -486,6 +530,11 @@ def run_backtest(
         if increasing and daily_on and halted:
             log_skip(bar, "daily_circuit_breaker", price=raw, budget=equity_at(raw) * cfg.position_frac)
             return False
+        side = 1 if delta > 0 else -1
+        blocked = limit_block(bar, side, raw, total_slip_bps(abs(delta) * raw, bar.quote_volume, cfg.cost))
+        if blocked:
+            log_skip(bar, blocked, price=raw, qty=abs(delta))
+            return False
         if increasing and under_minimum(delta, raw, bar):
             side = 1 if delta > 0 else -1
             slip_bps = total_slip_bps(abs(delta) * raw, bar.quote_volume, cfg.cost)
@@ -528,6 +577,12 @@ def run_backtest(
         if blocked_lots == 1:
             warnings.append("資金不足一手，這次沒有拆成零股。現貨也不會用槓桿補一手。")
 
+    def remember_exit(closed_exposure: float) -> None:
+        nonlocal executed, reentry_block
+        executed = 0.0
+        if cfg.entry_trigger == "edge" and abs(closed_exposure) > 1e-9:
+            reentry_block = closed_exposure
+
     for i, bar in enumerate(bars):
         bought_this_bar = False
         if daily_on:
@@ -536,36 +591,65 @@ def run_backtest(
                 sod_date = day
                 sod_equity = cfg.capital if i == 0 else equity_rows[-1]["equity"]
                 halted = False
-        if pulse:
-            if pending_pulse and qty == 0:
-                open_to_exposure(1.0, bar)
-            pending_pulse = False
-        elif pending is not None:
-            desired_exp = float(pending)
+        if bar.suspended:
             pending = None
-            if abs(desired_exp - executed) > 1e-9 or (abs(desired_exp) > 1e-9 and qty == 0):
-                open_to_exposure(desired_exp, bar)
+            pending_pulse = False
+            log_skip(bar, "suspended", price=bar.open)
+        else:
+            if pulse:
+                if pending_pulse and qty == 0:
+                    open_to_exposure(1.0, bar)
+                    reentry_block = None
+                pending_pulse = False
+            elif pending is not None:
+                desired_exp = float(pending)
+                pending = None
+                same_target = reentry_block is not None and abs(desired_exp - reentry_block) <= 1e-9
+                if cfg.entry_trigger == "edge" and same_target and qty == 0:
+                    if not edge_noted:
+                        edge_noted = True
+                        warnings.append("出場後目標曝險沒變，預設要等訊號改向才再進場。entry_trigger=level 才會沿用舊的下一根再進。")
+                else:
+                    changed = abs(desired_exp - executed) > 1e-9 or (
+                        cfg.entry_trigger == "level" and abs(desired_exp) > 1e-9 and qty == 0
+                    )
+                    if changed:
+                        open_to_exposure(desired_exp, bar)
+                    if reentry_block is not None and not same_target:
+                        reentry_block = None
 
-        allow_exit = qty != 0 and (cfg.intrabar_exit_on_entry or not bought_this_bar)
-        if allow_exit:
-            side = 1 if qty > 0 else -1
-            sl, tp = _levels(side, entry, cfg.tp_pct, cfg.sl_pct)
-            liq = None
-            if cfg.instrument == "perpetual":
-                liq = liquidation_price(entry, abs(qty), wallet, cfg.mmr, side)
-            decision = decide_exit(side, bar.open, bar.high, bar.low, sl, tp, liq)
-            if decision is not None:
-                reason, raw = decision
-                # 開盤跳空用開盤時間；打在高低點的止盈止損算在這根收盤。
-                filled_at = bar.open_time if raw == bar.open else bar.close_time
-                apply_delta(-qty, raw, bar, reason, force=True, when=filled_at)
-                executed = 0.0
+            locked_today = bought_this_bar and (cfg.t_plus_one or not cfg.intrabar_exit_on_entry)
+            allow_exit = qty != 0 and not locked_today
+            if allow_exit:
+                side = 1 if qty > 0 else -1
+                sl, tp = _levels(side, entry, cfg.tp_pct, cfg.sl_pct)
+                liq = None
+                if cfg.instrument == "perpetual":
+                    liq = liquidation_price(entry, abs(qty), wallet, cfg.mmr, side)
+                decision = decide_exit(side, bar.open, bar.high, bar.low, sl, tp, liq)
+                if decision is not None:
+                    reason, raw = decision
+                    close_side = -1 if qty > 0 else 1
+                    blocked = limit_block(bar, close_side, raw, total_slip_bps(abs(qty) * raw, bar.quote_volume, cfg.cost))
+                    if blocked:
+                        log_skip(bar, blocked, price=raw, qty=abs(qty))
+                    else:
+                        # 開盤跳空用開盤時間；打在高低點的止盈止損算在這根收盤。
+                        filled_at = bar.open_time if raw == bar.open else bar.close_time
+                        closed_exposure = executed
+                        apply_delta(-qty, raw, bar, reason, force=True, when=filled_at)
+                        remember_exit(closed_exposure)
 
-        if indicator_exits is not None and qty != 0 and float(indicator_exits[i] or 0) > 0:
-            apply_delta(-qty, bar.close, bar, "indicator_exit", force=True, when=bar.close_time)
-            executed = 0.0
+            if indicator_exits is not None and qty != 0 and not locked_today and float(indicator_exits[i] or 0) > 0:
+                blocked = limit_block(bar, -1 if qty > 0 else 1, bar.close, total_slip_bps(abs(qty) * bar.close, bar.quote_volume, cfg.cost))
+                if blocked:
+                    log_skip(bar, blocked, price=bar.close, qty=abs(qty))
+                else:
+                    closed_exposure = executed
+                    apply_delta(-qty, bar.close, bar, "indicator_exit", force=True, when=bar.close_time)
+                    remember_exit(closed_exposure)
 
-        if qty != 0 and cfg.instrument == "perpetual":
+        if qty != 0 and cfg.instrument == "perpetual" and not bar.suspended:
             while fund_idx < len(funding) and funding[fund_idx].time < bar.open_time:
                 fund_idx += 1
             cursor = fund_idx
@@ -592,11 +676,12 @@ def run_backtest(
                 cursor += 1
             fund_idx = cursor
             if wallet < 0 and qty != 0:
+                closed_exposure = executed
                 wallet = 0.0
                 qty = 0.0
                 entry = 0.0
-                executed = 0.0
                 liquidations += 1
+                remember_exit(closed_exposure)
                 warnings.append("資金費使錢包低於零，部位被視為清算。沒有追加保證金。")
 
         eq = equity_at(bar.close)

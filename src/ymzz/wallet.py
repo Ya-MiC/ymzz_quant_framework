@@ -114,6 +114,18 @@ def _event(signature, stamp, kind, assets, implied, note, pnl, **extra):
     }
 
 
+def _oldest_first(events: list[dict]) -> list[dict]:
+    """getSignaturesForAddress 由新到舊。跟單必須先買後賣，沒有時間的事件放最後。"""
+
+    def key(event: dict):
+        text = event.get("time") or ""
+        if not text:
+            return (1, "")
+        return (0, text)
+
+    return sorted(events, key=key)
+
+
 def inspect_address(address: str, client: DataClient, limit: int = 10, mode: str = "live") -> dict:
     address = (address or "").strip()
     if len(address) < 32 or len(address) > 48:
@@ -150,6 +162,7 @@ def inspect_address(address: str, client: DataClient, limit: int = 10, mode: str
             events.append(event)
         except WalletError as exc:
             errors.append({"signature": signature, "message_zh": exc.message_zh})
+    events = _oldest_first(events)
     counts: dict[str, int] = {}
     for event in events:
         counts[event["kind"]] = counts.get(event["kind"], 0) + 1
@@ -181,6 +194,7 @@ def replay_swaps(
     if not base_mint:
         raise ConfigError("跟單要指定標的鑄幣，不能把每一筆兌換都當成同一個幣。")
     bars = sorted(bars, key=lambda bar: bar.open_time)
+    events = _oldest_first(events)
     cash = float(capital)
     base = 0.0
     rows = []
