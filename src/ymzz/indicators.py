@@ -117,6 +117,28 @@ def macd(values, fast: int = 12, slow: int = 26, signal: int = 9):
     return dif, dea, hist
 
 
+def atr(highs, lows, closes, period: int):
+    """真實波幅的簡單平均。本根高低，以及相對前一根收盤的跳空，取最大，再做 SMA。
+
+    只用已經發生的價格。週期未滿的位置是空值。
+    """
+    if period < 1:
+        raise ConfigError("ATR 週期至少為 1")
+    high = _as_float_array(highs)
+    low = _as_float_array(lows)
+    close = _as_float_array(closes)
+    if not (len(high) == len(low) == len(close)):
+        raise ConfigError("高低收的長度必須一樣")
+    tr = np.empty(len(close), dtype=float)
+    for i in range(len(close)):
+        span = float(high[i] - low[i])
+        if i == 0:
+            tr[i] = span
+            continue
+        tr[i] = max(span, abs(float(high[i] - close[i - 1])), abs(float(low[i] - close[i - 1])))
+    return sma(tr, period)
+
+
 def bollinger(values, period: int = 20, mult: float = 2.0):
     """布林通道。中軌為 SMA，上下軌為中軌 ± mult * 母體標準差。John Bollinger。"""
     if period < 2 or mult <= 0:

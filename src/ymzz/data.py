@@ -407,6 +407,93 @@ def load_kraken_futures(client: DataClient, symbol: str, timeframe: str, now: da
     return bars, funding, extra
 
 
+def merge_futures_bars(bars: list[Bar], duration: timedelta) -> tuple[list[Bar], list[dict]]:
+    """依開盤時間合併。同一根價格不一致就停止。中間有缺口時，只留下最靠近現在、而且連續的那一段。缺口不補 0。"""
+    ordered = sorted(bars, key=lambda bar: bar.open_time)
+    merged: list[Bar] = []
+    for bar in ordered:
+        if merged and merged[-1].open_time == bar.open_time:
+            prev = merged[-1]
+            for name in ("open", "high", "low", "close"):
+                if abs(float(getattr(prev, name)) - float(getattr(bar, name))) > 1e-6:
+                    raise DataSourceError("同一根期貨 K 線兩次抓到的價格不一樣。沒有合併，也沒有挑較好看的一根。")
+            continue
+        merged.append(bar)
+    gaps = []
+    start = 0
+    for i in range(1, len(merged)):
+        if merged[i].open_time - merged[i - 1].open_time > duration * 1.5:
+            gaps.append(
+                {
+                    "after": merged[i - 1].open_time.isoformat(),
+                    "before": merged[i].open_time.isoformat(),
+                }
+            )
+            start = i
+    return merged[start:], gaps
+
+
+def load_kraken_futures_history(
+    client: DataClient,
+    symbol: str,
+    timeframe: str,
+    now: datetime,
+    earliest: datetime,
+) -> tuple[list[Bar], list[Funding], dict]:
+    """往前翻公開圖表。`from` 回的是從那個時刻往後最多 2000 根，所以用更早的起點去接。接不起來的洞不填。"""
+    try:
+        market = FUTURES_MARKET[symbol]
+    except KeyError as exc:
+        raise ConfigError("期貨回測只接 BTC/USD、ETH/USD、SOL/USD 的線性永續。沒有對過的代碼不會猜。") from exc
+    duration = DURATION[timeframe]
+    url = f"https://futures.kraken.com/api/charts/v1/trade/{market}/{timeframe}"
+    collected: list[Bar] = []
+    pages = 0
+    cursor = None
+    last_oldest = None
+    latest_sha = None
+    for _ in range(8):
+        params = None if cursor is None else {"from": str(cursor)}
+        payload, prov = client.get_json(url, params, mode="live")
+        try:
+            page, _extra = parse_kraken_futures_candles(payload, timeframe, now)
+        except DataSourceError:
+            if collected:
+                break
+            raise
+        pages += 1
+        if cursor is None:
+            latest_sha = prov.get("sha256")
+        if not page:
+            break
+        collected.extend(page)
+        oldest = min(bar.open_time for bar in page)
+        if last_oldest is not None and oldest >= last_oldest:
+            break
+        last_oldest = oldest
+        if oldest <= earliest:
+            break
+        cursor = int((oldest - duration * 1990).timestamp())
+    bars, gaps = merge_futures_bars(collected, duration)
+    fund_url = "https://futures.kraken.com/derivatives/api/v4/historicalfundingrates"
+    funding_payload, fund_prov = client.get_json(fund_url, {"symbol": market}, mode="live")
+    funding = parse_kraken_funding_rates(funding_payload)
+    meta = {
+        "futures_symbol": market,
+        "lot_decimals": FUTURES_DECIMALS[market],
+        "pages": pages,
+        "gaps": gaps,
+        "dropped_before_gap": bool(gaps),
+        "funding_first": funding[0].time.isoformat(),
+        "funding_last": funding[-1].time.isoformat(),
+        "funding_points": len(funding),
+        "funding_sha256": fund_prov.get("sha256"),
+        "latest_page_sha256": latest_sha,
+        "note_zh": "Kraken 線性永續成交 K 線。往前翻頁接上；價格不一致或中間缺根就停止補洞。資金費只用 relativeFundingRate。",
+    }
+    return bars, funding, meta
+
+
 def load_kraken_limits(client: DataClient, mode: str = "live", pair: str = "XBTUSD") -> tuple[dict, dict]:
     payload, prov = client.get_json("https://api.kraken.com/0/public/AssetPairs", {"pair": pair}, mode=mode)
     limits = parse_kraken_asset_pairs(payload)

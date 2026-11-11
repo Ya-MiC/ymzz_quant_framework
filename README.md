@@ -59,6 +59,8 @@ PYTHONPATH=src python -m ymzz.cli run --preset hf --once
 
 它跑 BTC/USD 的 1 小時現貨，名義 10 美元，進場就附止損和止盈。`--live` 會拒絕。2026-11-11 的 30 日樣本外是虧的，數字在 [一個月高頻觸發](docs/1111_1608_seoul_一個月高頻觸發.md)。
 
+低頻趨勢的費後驗證在 [低頻趨勢費後驗證](docs/1111_1618_seoul_低頻趨勢費後驗證.md)。訓練窗凍結的規則在最近 30 日沒有賺到錢。失敗過的版本留在倉庫裡，記在 [失敗紀錄](docs/failures/1111_1618_seoul_失敗紀錄.md)。
+
 `--live` 預設拒絕。要送實盤必須同時有環境變數 `KRAKEN_API_KEY`、`KRAKEN_API_SECRET` 和 `--i-confirm-live`。硬上限是本金不超過 10 美元、現貨 1 倍、買單一定附止損。程式不會印出密鑰。這份倉庫的測試沒有、也不會打實盤。入金、權限與交鑰步驟見 [Kraken 入金與 API 設定教程](docs/kraken_入金與API設定教程.md)。
 
 紙上訊號機器人：
