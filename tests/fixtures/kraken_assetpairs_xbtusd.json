@@ -1,0 +1,13 @@
+{
+  "error": [],
+  "result": {
+    "XXBTZUSD": {
+      "altname": "XBTUSD",
+      "wsname": "XBT/USD",
+      "ordermin": "0.00006",
+      "costmin": "0.5",
+      "lot_decimals": 8,
+      "status": "online"
+    }
+  }
+}

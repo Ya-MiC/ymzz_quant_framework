@@ -2,7 +2,7 @@
 
 多市場研究用的回測與紙上訊號。品牌是晏銘湛箴（YMZZ）。授權 MIT。
 
-這版做三件事：用真實公開行情回測、把槓桿上限鎖在 2 倍、預留以後用自己的 Telegram 機器人發訊號。它不下單，不收私鑰，也不連接付費 API。
+這版做三件事：用真實公開行情回測、把槓桿上限鎖在 2 倍、預留以後用自己的 Telegram 機器人發訊號。預設不下單、不收私鑰、不連接付費 API。實盤路徑要另外打開，而且本金、槓桿與止損有硬上限。
 
 ## 安裝與執行
 
@@ -16,6 +16,34 @@ PYTHONPATH=src python -m ymzz.api
 ```
 
 瀏覽器打開 <http://127.0.0.1:8765> 。介面、說明與報告用繁體中文。
+
+自己跑回測，不必經過助理：
+
+```bash
+PYTHONPATH=src python -m ymzz.cli backtest \
+  --strategy rsi_macd --source kraken --symbol BTC/USD --timeframe 1d \
+  --start 2026-01-01 --end 2026-11-11 \
+  --rsi 14 --rsi-low 40 --rsi-high 70 --rsi-exit 75 --macd 12,26,9 \
+  --sl 0.05 --tp 0.10 --size 1.0 --capital 10 --fee-bp 40 --slip-bp 5 --daily-loss 0.15
+```
+
+會在 `results/` 寫出帳本 CSV 與 `MMDD_HHMM_seoul_*.md`（內文時間是首爾時間），並把同一份報告複製到 `docs/`。`--strategy` 也可以是 `macd`、`rsi_single`、`rsi_three`、`bollinger`、`ma_cross`、`grid`。來源只接受 `kraken` 或 `okx`；失敗就停，不會改接別的交易所。
+
+紙上決策，適合 cron。同一根已收盤 K 線重跑不會再下單：
+
+```bash
+PYTHONPATH=src python -m ymzz.cli paper \
+  --strategy rsi_macd --source kraken --symbol BTC/USD --timeframe 1d \
+  --size 1.0 --capital 10 --sl 0.05 --tp 0.10 --daily-loss 0.15
+```
+
+```cron
+10 0 * * * cd /path/to/ymzz && PYTHONPATH=src python -m ymzz.cli paper --strategy rsi_macd --source kraken --symbol BTC/USD --timeframe 1d --size 1.0 --capital 10 >> data/paper/cron.log 2>&1
+```
+
+狀態在 `data/paper/state.json`，決策會附加到旁邊的 CSV 與 Markdown。紙上單呼叫本機的 `kraken paper buy`、`kraken paper sell`、`kraken paper status`（krakenfx/kraken-cli，MIT）。沒有安裝 CLI 時，有訊號的那一步會失敗並留下錯誤，不會假裝成交。
+
+`--live` 預設拒絕。要送實盤必須同時有環境變數 `KRAKEN_API_KEY`、`KRAKEN_API_SECRET` 和 `--i-confirm-live`。硬上限是本金不超過 10 美元、現貨 1 倍、買單一定附止損。程式不會印出密鑰。這份倉庫的測試沒有、也不會打實盤。
 
 紙上訊號機器人：
 
@@ -38,6 +66,7 @@ PYTHONPATH=src python -m ymzz.telegram_bot
 | `bollinger` | 下軌、中軌 | 收盤跌破下軌做多，站回中軌平倉。上軌只畫圖。標準差是母體。 |
 | `ma_cross` | 快均線、慢均線 | 預設 5 與 20。金叉做多，死叉平倉。 |
 | `grid` | 價格對格線 | 等差格。沒填上下界時，用第一根收盤 ± 幅度固定，不用全樣本高低點。 |
+| `rsi_macd` | RSI、DIF、DEA | 收盤出現 MACD 金叉，而且 RSI(14) 在 40 到 70，才在下一根開盤做多。出場看誰先到：止損 5%、止盈 10%、MACD 死叉，或 RSI 收盤大於 75。死叉和 RSI 出場用該根收盤價。同一根同時碰到止盈和止損時先止損。週期和門檻都可以改。柱狀圖只顯示，不參與決策。 |
 
 現貨遇上空頭訊號會改成平倉。永續要做空必須另勾「允許做空」。布林回歸與網格這版不做空。
 
@@ -57,6 +86,8 @@ PYTHONPATH=src python -m ymzz.telegram_bot
 
 加密預設本金 10 美元。貴州茅台一手遠高於這個數字，A 股預設 20 萬元；不夠一手就停止，不拆零股。
 
+另外可以設倉位比例（預設 1，也就是 10 美元全用上）、UTC 日虧熔斷（預設一天虧掉日初權益的 15% 就不再開新倉；新的 UTC 日會清掉這個限制，所以日線的下一筆進場通常落在新的一天），以及交易所最小下單量。Kraken 的最小幣數與最小名義向公開 `AssetPairs` 讀取，這次是 0.00006 BTC 與 0.5 USD。低於下限的單記成 `below minimum`，不算成交。10 美元的 30% 在比特幣現價買不起這個最小量。其他交易所沒有查到最小量時，報告會寫明這次沒有套用，不會拿 Kraken 的數字去套 OKX。
+
 ## 資料
 
 每個來源失敗都會帶著 HTTP 狀態停下，不會改問下一個。快取記下網址、UTC、首爾時間與 sha256。即時模式失敗時不讀舊快取充數。未收盤 K 線會剔除。
@@ -64,7 +95,7 @@ PYTHONPATH=src python -m ymzz.telegram_bot
 | 市場 | 來源 | 說明 |
 | --- | --- | --- |
 | A 股日線 | 新浪、騰訊前復權、東財 `fqt=1` | 只有日線。新浪沒有復權參數，不稱作前復權。騰訊與東財的量是手，程式乘 100 成股。東財主機要明示，預設 `80.push2his.eastmoney.com`，不會輪詢。 |
-| BTC 現貨 | OKX、幣安、Kraken `BTC/USD` | OKX 日線切在 UTC+8。幣安與 Kraken 切在 UTC。不要混著比訊號。 |
+| BTC 現貨 | OKX、幣安、Kraken `BTC/USD` | OKX 日線切在 UTC+8。幣安與 Kraken 切在 UTC。Kraken 公開 OHLC 大約 720 根，未收盤與 `last` 之後的 K 線會剔除。不要混著比訊號。 |
 | BTC 永續 | OKX、幣安 | 必須同時拿到資金費。Kraken 這版沒有永續。 |
 | Solana 池 | GeckoTerminal 日線與 15 分 | 熱門池有生存者偏差。預設 30bp 是假設的池費。 |
 | Polymarket | Gamma 市場 + CLOB `prices-history` | 用 token id。歷史是價格點。HTTP 451 或空陣列就停止，不用現價編歷史。 |
@@ -84,6 +115,18 @@ PYTHONPATH=src python -m ymzz.telegram_bot
 
 freqtrade、backtesting.py、vectorbt、python-telegram-bot 只可當對照，原始碼沒有進這個倉庫。
 
+## 2026-11-11 的 Kraken 日線重跑
+
+規則事先固定：RSI+MACD、倉位 100%、本金 10 美元、手續費 40 bp、滑點 5 bp、止損 5%、止盈 10%、日虧熔斷 15%。雲端在 2026-11-11 10:32 KST 用 Kraken 公開 OHLC 與 AssetPairs 重跑 2026-01-01 至最新已收盤日線，314 根。
+
+5 筆來回，勝率 40%，期末 **11.0269** 美元（四捨五入就是先前報告的 11.03），報酬 **+10.27%**，最大回撤 **5.36%**，樣本期買入持有 **-16.53%**。五筆的成交價與先前核准明細相同。完整表在 `docs/1111_1032_seoul_rsi_macd_kraken_1d.md`。
+
+5 筆什麼都證明不了。同一份核准紀錄裡，4 小時與 1 小時全部虧錢，不建議拿 10 美元去模擬那些週期。這不是投資建議。回測用下一根開盤加固定滑點，沒有排隊、沒有部分成交。
+
 ## 測試
 
-`PYTHONPATH=src pytest` 含槓桿上限、清算、手續費與滑點、止盈止損順序、RSI 週期改變數值、錄製下來的來源樣本，以及錢包分類。真實網路只在 `python -m ymzz.examples`，結果寫到 `results/`，檔名像 `MMDD_HHMM_seoul_*.md`。
+`PYTHONPATH=src pytest` 含槓桿上限、清算、手續費與滑點、止盈止損順序、RSI 週期改變數值、RSI+MACD 的進場區間與最小下單量、紙上決策的冪等與實盤拒絕、錄製下來的來源樣本，以及錢包分類。真實網路的範例是 `python -m ymzz.examples` 與上面的 `python -m ymzz.cli backtest`。
+
+## English
+
+YMZZ is an MIT-licensed research framework. Pick a strategy, run a backtest on public candles, or let cron take one paper decision on the latest closed candle. Live orders stay off unless both Kraken environment variables are set and `--i-confirm-live` is passed; capital then cannot exceed 10 USD, and the only allowed order is spot with 1x leverage and a stop attached. The Kraken daily RSI+MACD rerun on 2026-11-11 made 5 trades, won 40%, and turned 10 USD into 11.03 USD (+10.27%, max drawdown 5.36%) against a buy-and-hold of -16.53%. Five trades prove nothing, and the 4h and 1h variants lost money. This is not investment advice.

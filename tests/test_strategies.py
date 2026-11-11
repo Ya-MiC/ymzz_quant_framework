@@ -12,7 +12,7 @@ from ymzz.strategies import (
 
 
 def test_every_strategy_has_at_most_three_decision_indicators():
-    assert set(STRATEGIES) == {"rsi_single", "rsi_three", "macd", "bollinger", "ma_cross", "grid"}
+    assert set(STRATEGIES) == {"rsi_single", "rsi_three", "macd", "bollinger", "ma_cross", "grid", "rsi_macd"}
     for spec in STRATEGIES.values():
         assert 1 <= len(spec.decision_indicators) <= 3
 

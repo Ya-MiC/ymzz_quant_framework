@@ -261,6 +261,29 @@ STRATEGIES: dict[str, StrategySpec] = {
             _p("n_grids", "格數", 5, 2, 20),
         ],
     ),
+    "rsi_macd": StrategySpec(
+        id="rsi_macd",
+        name_zh="RSI + MACD",
+        summary_zh="收盤 MACD 金叉且 RSI 落在區間才做多；止損、止盈、死叉或 RSI 過熱，誰先到就出場。",
+        formula_zh=(
+            "進場：已收盤 K 上 MACD(12,26,9) 的 DIF 由下向上穿越 DEA，而且當根 RSI(14) 在 40 到 70（含兩端）。"
+            "下一根開盤才買。出場看誰先發生：相對成交價止損 5%、止盈 10%、MACD 死叉、或 RSI 收盤大於 75。"
+            "死叉與 RSI 出場用該根收盤價。同一根同時碰到止盈和止損時先止損。"
+            "上面的週期和門檻都可以改。決策指標是 RSI、DIF、DEA，柱狀圖只顯示。"
+        ),
+        source_zh="Wilder RSI（1978）與 Appel 的 MACD。進出場組合是本框架寫明的規則，不是從 GPL 策略檔複製。",
+        decision_indicators=["rsi", "dif", "dea"],
+        display_indicators=["rsi", "dif", "dea", "macd_hist"],
+        params=[
+            _p("rsi_period", "RSI 週期", 14, 2, 200),
+            _p("rsi_low", "RSI 進場下緣", 40, 1, 98, "金叉當根 RSI 必須大於等於這一條。"),
+            _p("rsi_high", "RSI 進場上緣", 70, 2, 99, "金叉當根 RSI 必須小於等於這一條。"),
+            _p("rsi_exit", "RSI 出場", 75, 3, 99, "收盤高於這一條就出場。"),
+            _p("macd_fast", "MACD 快線", 12, 2, 100),
+            _p("macd_slow", "MACD 慢線", 26, 3, 300),
+            _p("macd_signal", "MACD 訊號", 9, 2, 100),
+        ],
+    ),
 }
 
 
@@ -375,6 +398,34 @@ def compute_signals(strategy_id: str, closes: list[float], params: dict | None, 
         indicators["grid_lower"] = [float(lower)] * len(close)
         indicators["grid_upper"] = [float(upper)] * len(close)
         indicators["grid_exposure"] = _nan_list(exposure)
+    elif strategy_id == "rsi_macd":
+        period = int(resolved["rsi_period"])
+        low, high, exit_level = resolved["rsi_low"], resolved["rsi_high"], resolved["rsi_exit"]
+        if not (0 < low < high < exit_level < 100):
+            raise ConfigError("RSI 進場下緣要小於上緣，而且兩者都要低於出場線，並落在 0 到 100 之間")
+        fast = int(resolved["macd_fast"])
+        slow = int(resolved["macd_slow"])
+        signal_p = int(resolved["macd_signal"])
+        line = rsi(close, period)
+        dif, dea, hist = macd(close, fast, slow, signal_p)
+        entry = np.zeros(len(close))
+        ind_exit = np.zeros(len(close))
+        for i in range(1, len(close)):
+            if not (_finite_pair(dif, dea, i) and np.isfinite(line[i])):
+                continue
+            golden = dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]
+            death = dif[i - 1] >= dea[i - 1] and dif[i] < dea[i]
+            if golden and low <= float(line[i]) <= high:
+                entry[i] = 1.0
+            if death or float(line[i]) > exit_level:
+                ind_exit[i] = 1.0
+        signals = entry
+        indicators["rsi"] = _nan_list(line)
+        indicators["dif"] = _nan_list(dif)
+        indicators["dea"] = _nan_list(dea)
+        indicators["macd_hist"] = _nan_list(hist)
+        indicators["_indicator_exit"] = [float(v) for v in ind_exit]
+        warnings.append("RSI+MACD 的進場是單根脈衝，持倉直到止盈、止損或指標出場，不是每根都重算目標曝險。")
     else:
         raise ConfigError(f"沒有這個策略：{strategy_id}")
 

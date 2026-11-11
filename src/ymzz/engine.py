@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ymzz.errors import ConfigError, LeverageError
 
@@ -84,6 +85,12 @@ class EngineConfig:
     lot_size: float = 0.0
     intrabar_exit_on_entry: bool = True
     allow_short: bool = False
+    position_frac: float = 1.0
+    daily_loss_halt_pct: float | None = None
+    ordermin: float = 0.0
+    costmin: float = 0.0
+    lot_decimals: int | None = None
+    signal_mode: str = "target"
 
     def validated(self) -> "EngineConfig":
         self.leverage = enforce_leverage(self.leverage, self.instrument)
@@ -100,6 +107,16 @@ class EngineConfig:
             raise ConfigError("手數不能是負數")
         if self.instrument != "perpetual":
             self.allow_short = False
+        if not (0 < self.position_frac <= 1):
+            raise ConfigError("每筆倉位比例必須在 (0, 1]")
+        if self.daily_loss_halt_pct is not None and self.daily_loss_halt_pct <= 0:
+            raise ConfigError("日虧熔斷比例必須為正；要關掉請不要設定")
+        if self.ordermin < 0 or self.costmin < 0:
+            raise ConfigError("最小下單量不能是負數")
+        if self.lot_decimals is not None and self.lot_decimals < 0:
+            raise ConfigError("數量小數位不能是負數")
+        if self.signal_mode not in {"target", "pulse"}:
+            raise ConfigError("訊號模式只能是 target 或 pulse")
         return self
 
 
@@ -118,6 +135,14 @@ def fill_price(raw: float, side: int, slip_bps: float) -> float:
     if side > 0:
         return raw * (1.0 + rate)
     return raw * (1.0 - rate)
+
+
+def floor_qty(qty: float, decimals: int) -> float:
+    """數量向下取到小數位，避免四捨五入後超過交易所可下的量。"""
+    if decimals < 0:
+        raise ConfigError("數量小數位不能是負數")
+    scale = 10 ** decimals
+    return math.floor(qty * scale + 1e-12) / scale
 
 
 def liquidation_price(entry: float, qty_abs: float, wallet: float, mmr: float, side: int) -> float | None:
@@ -234,6 +259,8 @@ class BacktestResult:
     equity: list[dict]
     metrics: dict
     warnings: list[str]
+    skips: list[dict] = field(default_factory=list)
+    round_trips: list[dict] = field(default_factory=list)
 
     def to_public(self) -> dict:
         return {
@@ -241,6 +268,8 @@ class BacktestResult:
             "equity": self.equity,
             "metrics": self.metrics,
             "warnings": self.warnings,
+            "skips": self.skips,
+            "round_trips": self.round_trips,
         }
 
 
@@ -249,12 +278,16 @@ def run_backtest(
     signals: list[float],
     funding: list[Funding] | None,
     cfg: EngineConfig,
+    indicator_exits: list[float] | None = None,
 ) -> BacktestResult:
     cfg = cfg.validated()
     if len(bars) != len(signals):
         raise ConfigError("訊號長度必須和 K 線相同")
+    if indicator_exits is not None and len(indicator_exits) != len(bars):
+        raise ConfigError("指標出場長度必須和 K 線相同")
     if any(not bar.closed for bar in bars):
         raise ConfigError("回測拒絕未收盤 K 線。請在資料層先剔除。")
+    pulse = cfg.signal_mode == "pulse"
     funding = sorted(funding or [], key=lambda item: item.time)
     warnings: list[str] = []
     if cfg.instrument != "perpetual" and any(sig < -1e-12 for sig in signals):
@@ -270,6 +303,8 @@ def run_backtest(
     pending: float | None = None
     bought_this_bar = False
     trades: list[dict] = []
+    skips: list[dict] = []
+    round_trips: list[dict] = []
     equity_rows: list[dict] = []
     fees_paid = 0.0
     funding_paid = 0.0
@@ -278,6 +313,13 @@ def run_backtest(
     peak = wallet
     max_dd = 0.0
     fund_idx = 0
+    entry_state: dict | None = None
+    pending_pulse = False
+    sod_date = None
+    sod_equity = wallet
+    halted = False
+    daily_on = cfg.daily_loss_halt_pct is not None
+    warned_minimum = False
 
     def equity_at(mark: float) -> float:
         if qty == 0:
@@ -300,10 +342,12 @@ def run_backtest(
             }
         )
 
-    def apply_delta(delta: float, raw: float, bar: Bar, reason: str, force: bool = False) -> bool:
-        nonlocal wallet, qty, entry, fees_paid, liquidations
+    def apply_delta(delta: float, raw: float, bar: Bar, reason: str, force: bool = False, when: datetime | None = None) -> bool:
+        nonlocal wallet, qty, entry, fees_paid, liquidations, entry_state
         if abs(delta) < 1e-16:
             return False
+        prev_qty = qty
+        prev_entry = entry
         side = 1 if delta > 0 else -1
         notional_est = abs(delta) * raw
         slip_bps = total_slip_bps(notional_est, bar.quote_volume, cfg.cost)
@@ -345,7 +389,39 @@ def run_backtest(
             qty = 0.0
             entry = 0.0
         action = "buy" if side > 0 else "sell"
-        push_trade(action, delta, price, fee + stamp, reason, slip_bps, bar.open_time)
+        stamp_time = when or bar.open_time
+        push_trade(action, delta, price, fee + stamp, reason, slip_bps, stamp_time)
+        if prev_qty == 0 and qty != 0:
+            entry_state = {
+                "time": stamp_time,
+                "raw": raw,
+                "fill": price,
+                "fee": fee + stamp,
+            }
+        elif prev_qty != 0 and qty == 0 and entry_state is not None:
+            exit_fee = fee + stamp
+            side_sign = 1 if prev_qty > 0 else -1
+            pnl = side_sign * (price - prev_entry) * abs(prev_qty) - entry_state["fee"] - exit_fee
+            round_trips.append(
+                {
+                    "entry_time": entry_state["time"].isoformat(),
+                    "exit_time": stamp_time.isoformat(),
+                    "qty": abs(prev_qty),
+                    "entry_raw": entry_state["raw"],
+                    "entry_fill": entry_state["fill"],
+                    "exit_raw": raw,
+                    "exit_fill": price,
+                    "reason": reason,
+                    "pnl": pnl,
+                    "fees": entry_state["fee"] + exit_fee,
+                    "entry_fee": entry_state["fee"],
+                    "exit_fee": exit_fee,
+                    "equity_after": wallet,
+                }
+            )
+            entry_state = None
+        elif prev_qty != 0 and qty != 0 and abs(qty) > abs(prev_qty) and entry_state is not None:
+            entry_state["fee"] += fee + stamp
         return True
 
     def target_qty(raw: float, exposure: float, bar: Bar) -> float:
@@ -355,7 +431,7 @@ def run_backtest(
         if mark_equity <= 0:
             return 0.0
         lev = cfg.leverage
-        fraction = abs(exposure)
+        fraction = abs(exposure) * cfg.position_frac
         fee_rate = cfg.cost.fee_bps / 10000.0
         notional = mark_equity * lev * fraction / (1.0 + fee_rate * lev * fraction)
         slip_bps = total_slip_bps(notional, bar.quote_volume, cfg.cost)
@@ -367,27 +443,108 @@ def run_backtest(
             if units < 1:
                 return 0.0
             desired = side * units * cfg.lot_size
+        if cfg.lot_decimals is not None:
+            desired = side * floor_qty(abs(desired), cfg.lot_decimals)
         return desired
+
+    def log_skip(bar: Bar, reason: str, **extra) -> None:
+        nonlocal warned_minimum
+        row = {"time": bar.open_time.isoformat(), "reason": reason, **extra}
+        skips.append(row)
+        trades.append(
+            {
+                "time": bar.open_time.isoformat(),
+                "action": "skip",
+                "qty": float(extra.get("qty") or 0.0),
+                "price": float(extra.get("price") or bar.open),
+                "fee": 0.0,
+                "slippage_bps": 0.0,
+                "reason": reason,
+                "wallet_after": wallet,
+                "position_after": qty,
+                "equity_after": equity_at(bar.open),
+            }
+        )
+        if reason == "below minimum" and not warned_minimum:
+            warned_minimum = True
+            warnings.append("有進場低於交易所最小下單量，已記為 below minimum，沒有算進成交筆數。")
+
+    def under_minimum(delta: float, raw: float, bar: Bar) -> bool:
+        if cfg.ordermin <= 0 and cfg.costmin <= 0:
+            return False
+        if qty != 0 and delta * qty < 0 and abs(delta) <= abs(qty) + 1e-12:
+            return False
+        side = 1 if delta > 0 else -1
+        slip_bps = total_slip_bps(abs(delta) * raw, bar.quote_volume, cfg.cost)
+        price = fill_price(raw, side, slip_bps)
+        notional = abs(delta) * price
+        return abs(delta) <= 1e-16 or abs(delta) + 1e-15 < cfg.ordermin or notional + 1e-9 < cfg.costmin
+
+    def try_signal_delta(delta: float, raw: float, bar: Bar) -> bool:
+        """進場才受日虧熔斷與最小下單量限制。減倉與平倉照常。"""
+        increasing = qty == 0 or (delta * qty > 0) or (qty != 0 and abs(qty + delta) > abs(qty) + 1e-12)
+        if increasing and daily_on and halted:
+            log_skip(bar, "daily_circuit_breaker", price=raw, budget=equity_at(raw) * cfg.position_frac)
+            return False
+        if increasing and under_minimum(delta, raw, bar):
+            side = 1 if delta > 0 else -1
+            slip_bps = total_slip_bps(abs(delta) * raw, bar.quote_volume, cfg.cost)
+            price = fill_price(raw, side, slip_bps)
+            log_skip(
+                bar,
+                "below minimum",
+                qty=abs(delta),
+                price=price,
+                ordermin=cfg.ordermin,
+                costmin=cfg.costmin,
+                notional=abs(delta) * price,
+                budget=equity_at(raw) * cfg.position_frac,
+            )
+            return False
+        return apply_delta(delta, raw, bar, "signal")
+
+    def open_to_exposure(exposure: float, bar: Bar) -> bool:
+        nonlocal bought_this_bar, executed
+        desired = target_qty(bar.open, exposure, bar)
+        if abs(exposure) > 1e-9 and abs(desired) < 1e-16 and cfg.lot_size > 0 and cfg.ordermin <= 0 and cfg.costmin <= 0:
+            blocked_lots_add()
+            return False
+        delta = desired - qty
+        if abs(delta) <= 1e-12:
+            if abs(exposure) > 1e-9 and qty == 0 and (cfg.ordermin > 0 or cfg.costmin > 0):
+                log_skip(bar, "below minimum", qty=0.0, price=bar.open, ordermin=cfg.ordermin, costmin=cfg.costmin, notional=0.0)
+            return False
+        ok = try_signal_delta(delta, bar.open, bar)
+        if ok:
+            bought_this_bar = delta > 0 and qty != 0
+            executed = exposure if qty != 0 else 0.0
+        elif qty == 0:
+            executed = 0.0
+        return ok
+
+    def blocked_lots_add() -> None:
+        nonlocal blocked_lots
+        blocked_lots += 1
+        if blocked_lots == 1:
+            warnings.append("資金不足一手，這次沒有拆成零股。現貨也不會用槓桿補一手。")
 
     for i, bar in enumerate(bars):
         bought_this_bar = False
-        if pending is not None:
+        if daily_on:
+            day = bar.open_time.astimezone(timezone.utc).date()
+            if day != sod_date:
+                sod_date = day
+                sod_equity = cfg.capital if i == 0 else equity_rows[-1]["equity"]
+                halted = False
+        if pulse:
+            if pending_pulse and qty == 0:
+                open_to_exposure(1.0, bar)
+            pending_pulse = False
+        elif pending is not None:
             desired_exp = float(pending)
             pending = None
             if abs(desired_exp - executed) > 1e-9 or (abs(desired_exp) > 1e-9 and qty == 0):
-                desired = target_qty(bar.open, desired_exp, bar)
-                if abs(desired_exp) > 1e-9 and abs(desired) < 1e-16 and cfg.lot_size > 0:
-                    blocked_lots += 1
-                    if blocked_lots == 1:
-                        warnings.append("資金不足一手，這次沒有拆成零股。現貨也不會用槓桿補一手。")
-                else:
-                    delta = desired - qty
-                    if abs(delta) > 1e-12:
-                        if apply_delta(delta, bar.open, bar, "signal"):
-                            bought_this_bar = delta > 0
-                            executed = desired_exp if qty != 0 else 0.0
-                        else:
-                            executed = 0.0 if qty == 0 else executed
+                open_to_exposure(desired_exp, bar)
 
         allow_exit = qty != 0 and (cfg.intrabar_exit_on_entry or not bought_this_bar)
         if allow_exit:
@@ -399,8 +556,14 @@ def run_backtest(
             decision = decide_exit(side, bar.open, bar.high, bar.low, sl, tp, liq)
             if decision is not None:
                 reason, raw = decision
-                apply_delta(-qty, raw, bar, reason, force=True)
+                # 開盤跳空用開盤時間；打在高低點的止盈止損算在這根收盤。
+                filled_at = bar.open_time if raw == bar.open else bar.close_time
+                apply_delta(-qty, raw, bar, reason, force=True, when=filled_at)
                 executed = 0.0
+
+        if indicator_exits is not None and qty != 0 and float(indicator_exits[i] or 0) > 0:
+            apply_delta(-qty, bar.close, bar, "indicator_exit", force=True, when=bar.close_time)
+            executed = 0.0
 
         if qty != 0 and cfg.instrument == "perpetual":
             while fund_idx < len(funding) and funding[fund_idx].time < bar.open_time:
@@ -450,13 +613,34 @@ def run_backtest(
                 "position": qty,
             }
         )
-        if i < len(bars) - 1:
+        if daily_on and sod_equity > 0 and (sod_equity - eq) / sod_equity >= cfg.daily_loss_halt_pct - 1e-15:
+            halted = True
+            equity_rows[-1]["halted"] = True
+        if pulse:
+            if qty == 0 and i < len(bars) - 1 and float(signals[i]) > 0:
+                pending_pulse = True
+        elif i < len(bars) - 1:
             pending = float(signals[i])
+
+    if pulse and qty != 0:
+        last = bars[-1]
+        apply_delta(-qty, last.close, last, "end_of_data", force=True, when=last.close_time)
+        eq = equity_at(last.close)
+        if eq > peak:
+            peak = eq
+        drawdown = (peak - eq) / peak if peak > 0 else 0.0
+        max_dd = max(max_dd, drawdown)
+        equity_rows[-1]["equity"] = eq
+        equity_rows[-1]["wallet"] = wallet
+        equity_rows[-1]["position"] = qty
+        equity_rows[-1]["drawdown"] = drawdown
+        warnings.append("樣本結束時仍有持倉，已按最後一根收盤價平倉（含滑點與手續費）。")
 
     final_equity = equity_rows[-1]["equity"] if equity_rows else wallet
     price_note = "未平倉以最後一根收盤做市值，帳本上仍是持倉，沒有假造成交。"
     if qty != 0:
         warnings.append(price_note)
+    wins = sum(1 for trip in round_trips if trip["pnl"] > 0)
     metrics = {
         "initial_capital": cfg.capital,
         "final_equity": final_equity,
@@ -473,5 +657,60 @@ def run_backtest(
         "instrument": cfg.instrument,
         "unrealized_pnl": (final_equity - wallet) if equity_rows else 0.0,
         "mark_to_market_not_a_fill": qty != 0,
+        "position_frac": cfg.position_frac,
+        "round_trips": len(round_trips),
+        "wins": wins,
+        "win_rate": (wins / len(round_trips)) if round_trips else None,
+        "skips_below_minimum": sum(1 for row in skips if row["reason"] == "below minimum"),
+        "skips_halt": sum(1 for row in skips if row["reason"] == "daily_circuit_breaker"),
     }
-    return BacktestResult(trades, equity_rows, metrics, warnings)
+    return BacktestResult(trades, equity_rows, metrics, warnings, skips, round_trips)
+
+
+def sample_buy_hold(
+    bars: list[Bar],
+    capital: float,
+    fee_bps: float,
+    slippage_bps: float,
+    lot_decimals: int | None = 8,
+    ordermin: float = 0.0,
+    costmin: float = 0.0,
+) -> dict:
+    """從第一根開盤買到最後收盤，用滿倉，同一套手續費與滑點。這是樣本期持有，不是訊號後才買。"""
+    if not bars or capital <= 0:
+        return {"possible": False, "reason": "no_bars", "return_pct": None, "end_equity": None}
+    first, last = bars[0], bars[-1]
+    fee = fee_bps / 10000.0
+    px_in = fill_price(first.open, 1, slippage_bps)
+    raw_qty = capital / (px_in * (1.0 + fee)) if px_in > 0 else 0.0
+    qty = floor_qty(raw_qty, lot_decimals) if lot_decimals is not None else raw_qty
+    notional = qty * px_in
+    if qty <= 0 or (ordermin > 0 and qty < ordermin) or (costmin > 0 and notional < costmin):
+        return {
+            "possible": False,
+            "reason": "below minimum",
+            "qty": qty,
+            "entry_fill": px_in,
+            "return_pct": None,
+            "end_equity": None,
+            "raw_move_pct": (last.close / first.open - 1.0) * 100.0 if first.open else None,
+        }
+    in_fee = notional * fee
+    cash = capital - notional - in_fee
+    px_out = fill_price(last.close, -1, slippage_bps)
+    out_fee = qty * px_out * fee
+    end = cash + qty * px_out - out_fee
+    return {
+        "possible": True,
+        "qty": qty,
+        "entry_time": first.open_time.isoformat(),
+        "exit_time": last.close_time.isoformat(),
+        "entry_raw": first.open,
+        "entry_fill": px_in,
+        "exit_raw": last.close,
+        "exit_fill": px_out,
+        "fees": in_fee + out_fee,
+        "end_equity": end,
+        "return_pct": (end / capital - 1.0) * 100.0,
+        "raw_move_pct": (last.close / first.open - 1.0) * 100.0,
+    }

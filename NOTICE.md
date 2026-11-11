@@ -12,6 +12,8 @@
 
 其餘執行期依賴是 NumPy、pandas、httpx、FastAPI、Uvicorn、Pydantic、pytest，授權為 BSD 或 MIT，與本專案的 MIT 授權相容。
 
+紙上單不把 kraken-cli 的原始碼包進來。指令列呼叫本機已安裝的 `kraken`（[krakenfx/kraken-cli](https://github.com/krakenfx/kraken-cli)，MIT）：`kraken paper buy`、`kraken paper sell`、`kraken paper status`。沒有安裝時，紙上步驟會報錯，不會改成自己撮合。
+
 ## 允許依賴、但這版沒有匯入它們的原始碼
 
 直接呼叫已核對的公開 REST／RPC，測試才不必在離線時拉整包交易所 SDK。

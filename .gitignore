@@ -5,4 +5,5 @@ venv/
 .env
 *.pyc
 data/cache/
+data/paper/
 .mypy_cache/

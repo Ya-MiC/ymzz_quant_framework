@@ -48,6 +48,15 @@
         <label>止盈比例<input id="tp" type="number" value="0.10" min="0" step="0.01" /></label>
         <label>止損比例<input id="sl" type="number" value="0.05" min="0" step="0.01" /></label>
       </div>
+      <div class="row">
+        <label>倉位比例<input id="size" type="number" value="1" min="0.01" max="1" step="0.05" /></label>
+        <label>日虧熔斷<input id="daily-loss" type="number" value="0.15" min="0" max="1" step="0.01" /></label>
+      </div>
+      <div class="row">
+        <label>最小幣數<input id="ordermin" type="number" min="0" step="0.00001" placeholder="空白＝Kraken 公開查詢" /></label>
+        <label>最小名義<input id="costmin" type="number" min="0" step="0.01" placeholder="空白＝同上" /></label>
+      </div>
+      <p class="note">倉位比例 1 表示用全部權益。日虧熔斷以 UTC 日初權益為準，當天不再開新倉，新的 UTC 日會重新計算。最小量留白時，只有 Kraken 會讀公開 AssetPairs；其他來源不套用最小量，並在結果裡寫明。</p>
       <label class="check"><input id="short" type="checkbox" /> 永續允許做空（現貨會被拒絕）</label>
       <p id="market-note" class="note"></p>
       <div class="actions">

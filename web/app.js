@@ -95,6 +95,10 @@ function readConfig() {
     tp_pct: Number($("tp").value),
     sl_pct: Number($("sl").value),
     allow_short: $("short").checked,
+    position_frac: Number($("size").value),
+    daily_loss_halt_pct: $("daily-loss").value === "" ? null : Number($("daily-loss").value),
+    ordermin: $("ordermin").value === "" ? null : Number($("ordermin").value),
+    costmin: $("costmin").value === "" ? null : Number($("costmin").value),
   };
 }
 
@@ -121,6 +125,10 @@ function applyConfig(config) {
   if (config.stamp_tax_bps != null) $("stamp").value = config.stamp_tax_bps;
   if (config.tp_pct != null) $("tp").value = config.tp_pct;
   if (config.sl_pct != null) $("sl").value = config.sl_pct;
+  if (config.position_frac != null) $("size").value = config.position_frac;
+  if (config.daily_loss_halt_pct != null) $("daily-loss").value = config.daily_loss_halt_pct;
+  if (config.ordermin != null) $("ordermin").value = config.ordermin;
+  if (config.costmin != null) $("costmin").value = config.costmin;
   $("short").checked = Boolean(config.allow_short);
 }
 
@@ -160,6 +168,8 @@ function renderResult(data) {
     ["資金費", num(metrics.funding_paid)],
     ["清算次數", metrics.liquidations ?? 0],
     ["成交筆數", metrics.trade_count ?? 0],
+    ["來回", metrics.round_trips ?? 0],
+    ["勝率", metrics.win_rate == null ? "—" : pct(metrics.win_rate)],
     ["槓桿", metrics.leverage ?? "—"],
   ].map(([name, value]) => `<div><span>${name}</span><strong>${value}</strong></div>`).join("");
   drawPrice($("price"), data);
@@ -200,7 +210,7 @@ function splitIndicators(indicators, lo, hi) {
   const overlays = [];
   const oscillators = [];
   Object.entries(indicators || {}).forEach(([name, values]) => {
-    if (!Array.isArray(values)) return;
+    if (name.startsWith("_") || !Array.isArray(values)) return;
     const finite = values.filter((value) => value != null && Number.isFinite(value));
     if (!finite.length) return;
     const mid = finite[Math.floor(finite.length / 2)];

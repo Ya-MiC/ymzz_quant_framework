@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ymzz.catalog import CATALOG, get_market
-from ymzz.data import load_market
+from ymzz.data import load_kraken_limits, load_market
 from ymzz.engine import CostConfig, EngineConfig, run_backtest
 from ymzz.errors import ConfigError, LeverageError, StockAppUnidentified, YmzzError
 from ymzz.http_cache import DataClient
@@ -56,6 +56,11 @@ class BacktestIn(BaseModel):
     strict_range: bool = True
     source_host: str | None = None
     data_mode: str = "live"
+    position_frac: float = 1.0
+    daily_loss_halt_pct: float | None = None
+    ordermin: float | None = None
+    costmin: float | None = None
+    lot_decimals: int | None = None
 
 
 class ConfigIn(BaseModel):
@@ -130,6 +135,24 @@ def create_app() -> FastAPI:
         bars, funding, provenance = load_market(body.model_dump(), client)
         closes = [bar.close for bar in bars]
         signals, indicators, warnings = compute_signals(body.strategy, closes, body.params, body.allow_short and instrument == "perpetual")
+        indicator_exits = indicators.pop("_indicator_exit", None)
+        ordermin = body.ordermin
+        costmin = body.costmin
+        lot_decimals = body.lot_decimals
+        if body.source == "kraken" and (ordermin is None or costmin is None or lot_decimals is None):
+            limits, limit_prov = load_kraken_limits(client, body.data_mode)
+            ordermin = limits["ordermin"] if ordermin is None else ordermin
+            costmin = limits["costmin"] if costmin is None else costmin
+            lot_decimals = limits["lot_decimals"] if lot_decimals is None else lot_decimals
+            provenance = {**provenance, "kraken_limits": limits, "kraken_limits_sha256": limit_prov.get("sha256")}
+            warnings.append(
+                f"Kraken 最小下單量來自公開 AssetPairs：ordermin {ordermin}、costmin {costmin}、小數位 {lot_decimals}。"
+            )
+        elif ordermin is None and costmin is None:
+            ordermin = 0.0
+            costmin = 0.0
+            warnings.append("這個來源沒有查詢最小下單量，本回測不套用最小量過濾。")
+        halt = body.daily_loss_halt_pct if body.daily_loss_halt_pct and body.daily_loss_halt_pct > 0 else None
         result = run_backtest(
             bars,
             signals,
@@ -151,7 +174,14 @@ def create_app() -> FastAPI:
                 lot_size=float(market.get("lot_size") or 0),
                 intrabar_exit_on_entry=body.market != "ashare",
                 allow_short=body.allow_short and instrument == "perpetual",
+                position_frac=body.position_frac,
+                daily_loss_halt_pct=halt,
+                ordermin=float(ordermin or 0),
+                costmin=float(costmin or 0),
+                lot_decimals=lot_decimals,
+                signal_mode="pulse" if indicator_exits is not None else "target",
             ),
+            indicator_exits=indicator_exits,
         )
         return {
             "ok": True,
@@ -159,6 +189,8 @@ def create_app() -> FastAPI:
             "warnings": warnings + result.warnings,
             "metrics": result.metrics,
             "trades": result.trades,
+            "skips": result.skips,
+            "round_trips": result.round_trips,
             "equity": result.equity,
             "indicators": indicators,
             "signals": signals,

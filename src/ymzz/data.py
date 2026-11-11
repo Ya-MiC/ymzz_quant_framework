@@ -217,6 +217,8 @@ def parse_kraken_ohlc(payload, timeframe: str, now: datetime) -> tuple[list[Bar]
     if payload.get("error"):
         raise DataSourceError(f"Kraken 錯誤：{payload.get('error')}")
     result = payload.get("result") or {}
+    raw_last = result.get("last")
+    last_id = int(raw_last) if raw_last not in (None, "") else None
     rows = None
     for key, value in result.items():
         if key != "last":
@@ -229,6 +231,9 @@ def parse_kraken_ohlc(payload, timeframe: str, now: datetime) -> tuple[list[Bar]
     dropped = 0
     for row in rows:
         opened = _dt_s(int(row[0]))
+        if last_id is not None and int(row[0]) > last_id:
+            dropped += 1
+            continue
         if ensure_utc(now) < opened + duration:
             dropped += 1
             continue
@@ -239,8 +244,43 @@ def parse_kraken_ohlc(payload, timeframe: str, now: datetime) -> tuple[list[Bar]
     return bars, {
         "timezone": "UTC",
         "dropped_unclosed": dropped + extra,
-        "note_zh": "Kraken 日線以 UTC 切開。公開 OHLC 的 count 參數不可靠，這裡用時間過濾，不用它。沒有成交額。",
+        "note_zh": "Kraken 以 UTC 切開。公開 OHLC 約 720 根，count 參數不可靠。last 之後與尚未走完的 K 線都剔除。沒有成交額。",
+        "kraken_last": last_id,
     }
+
+
+def parse_kraken_asset_pairs(payload) -> dict:
+    """Kraken 公開 AssetPairs。最小下單量只採用回應裡的數字，不寫死。"""
+    if payload.get("error"):
+        raise DataSourceError(f"Kraken AssetPairs 錯誤：{payload.get('error')}。沒有用寫死的最小量代替。")
+    result = payload.get("result") or {}
+    if not result:
+        raise DataSourceError("Kraken AssetPairs 是空的。沒有用寫死的最小量代替。")
+    key = next(iter(result))
+    info = result[key]
+    try:
+        limits = {
+            "result_key": key,
+            "wsname": info.get("wsname"),
+            "altname": info.get("altname"),
+            "ordermin": float(info["ordermin"]),
+            "costmin": float(info["costmin"]),
+            "lot_decimals": int(info["lot_decimals"]),
+            "status": info.get("status"),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DataSourceError("Kraken AssetPairs 缺少 ordermin、costmin 或 lot_decimals。沒有用估計值填補。") from exc
+    return limits
+
+
+def load_kraken_limits(client: DataClient, mode: str = "live") -> tuple[dict, dict]:
+    payload, prov = client.get_json("https://api.kraken.com/0/public/AssetPairs", {"pair": "XBTUSD"}, mode=mode)
+    limits = parse_kraken_asset_pairs(payload)
+    limits["source_url"] = prov.get("source_url")
+    limits["fetched_at_utc"] = prov.get("fetched_at_utc")
+    limits["fetched_at_kst"] = prov.get("fetched_at_kst")
+    limits["sha256"] = prov.get("sha256")
+    return limits, prov
 
 
 def parse_gecko_ohlcv(payload, timeframe: str, now: datetime) -> tuple[list[Bar], dict]:
