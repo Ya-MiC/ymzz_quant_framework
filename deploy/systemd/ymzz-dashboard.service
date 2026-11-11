@@ -1,0 +1,14 @@
+[Unit]
+Description=YMZZ local dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ymzz
+EnvironmentFile=-/opt/ymzz/.env
+ExecStart=/opt/ymzz/.venv/bin/python -m ymzz.cli dashboard --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

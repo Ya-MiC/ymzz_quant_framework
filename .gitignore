@@ -6,4 +6,7 @@ venv/
 *.pyc
 data/cache/
 data/paper/
+data/live/
+data/runner/
+data/dashboard/
 .mypy_cache/

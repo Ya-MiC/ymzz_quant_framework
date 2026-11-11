@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +25,7 @@ from ymzz.engine import CostConfig, EngineConfig, run_backtest, sample_buy_hold
 from ymzz.errors import ConfigError, YmzzError
 from ymzz.http_cache import DataClient
 from ymzz.paper import step_decision
+from ymzz.sim import build_runner
 from ymzz.strategies import compute_signals, get_strategy
 from ymzz.timeutil import now_utc, to_kst
 
@@ -295,7 +295,11 @@ def run_paper_cli(args, root: Path | None = None, runner=None) -> dict:
         live=args.live,
         confirm=args.i_confirm_live,
         leverage=1.0,
-        runner=runner or _subprocess_runner,
+        runner=runner or build_runner(
+            fee_bp=args.fee_bp,
+            slip_bp=args.slip_bp,
+            ledger_path=Path(str(log_stem) + "_sim.jsonl"),
+        ),
     )
     print(
         f"{decision.get('action')}  {decision.get('reason')}  "
@@ -304,8 +308,41 @@ def run_paper_cli(args, root: Path | None = None, runner=None) -> dict:
     return decision
 
 
-def _subprocess_runner(argv: list[str]):
-    return subprocess.run(argv, capture_output=True, text=True, check=False)
+def run_dashboard_cli(args) -> None:
+    import uvicorn
+
+    from ymzz.dashboard import create_dashboard_app
+
+    uvicorn.run(create_dashboard_app(), host=args.host, port=args.port, log_level="info")
+
+
+def run_daemon_cli(args, root: Path | None = None, step=None, sleep=None, cycles: int | None = None) -> dict:
+    from ymzz.runner import run_cycles
+
+    root = root or project_root()
+    if args.mode == "live":
+        args.live = True
+    else:
+        args.live = False
+        args.i_confirm_live = False
+    if args.state is None:
+        folder = "live" if args.live else "paper"
+        args.state = str(root / "data" / folder / "state.json")
+    args.source = "kraken"
+    if step is None:
+        step = lambda paper_args: run_paper_cli(paper_args, root)
+    lock = root / "data" / "runner" / "ymzz.lock"
+    beat = root / "data" / "runner" / "heartbeat.json"
+    if args.once:
+        cycles = 1 if cycles is None else cycles
+    return run_cycles(
+        args=args,
+        step=step,
+        sleep=sleep or __import__("time").sleep,
+        lock_path=lock,
+        heartbeat_path=beat,
+        cycles=cycles,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -340,6 +377,32 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument("--state", default=None)
     paper.add_argument("--live", action="store_true", help="改送實盤單。預設拒絕。")
     paper.add_argument("--i-confirm-live", action="store_true", dest="i_confirm_live")
+
+    run = sub.add_parser("run", help="常駐：心跳，並在新的已收盤 K 線上做一次決策")
+    run.add_argument("--mode", choices=["paper", "live"], default="paper")
+    run.add_argument("--i-confirm-live", action="store_true", dest="i_confirm_live")
+    run.add_argument("--interval", type=float, default=180)
+    run.add_argument("--once", action="store_true")
+    run.add_argument("--state", default=None)
+    run.add_argument("--strategy", default="rsi_macd")
+    run.add_argument("--symbol", default="BTC/USD")
+    run.add_argument("--timeframe", default="1d", choices=["1d", "4h", "1h"])
+    run.add_argument("--rsi", type=float, default=14)
+    run.add_argument("--rsi-low", type=float, default=40, dest="rsi_low")
+    run.add_argument("--rsi-high", type=float, default=70, dest="rsi_high")
+    run.add_argument("--rsi-exit", type=float, default=75, dest="rsi_exit")
+    run.add_argument("--macd", default="12,26,9")
+    run.add_argument("--sl", type=float, default=0.05)
+    run.add_argument("--tp", type=float, default=0.10)
+    run.add_argument("--size", type=float, default=1.0)
+    run.add_argument("--capital", type=float, default=10)
+    run.add_argument("--fee-bp", type=float, default=40, dest="fee_bp")
+    run.add_argument("--slip-bp", type=float, default=5, dest="slip_bp")
+    run.add_argument("--daily-loss", type=float, default=0.15, dest="daily_loss")
+
+    dashboard = sub.add_parser("dashboard", help="本機多端儀表臺，預設 127.0.0.1:8787")
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8787)
     return parser
 
 
@@ -351,6 +414,10 @@ def main(argv: list[str] | None = None) -> int:
             run_backtest_cli(args)
         elif args.command == "paper":
             run_paper_cli(args)
+        elif args.command == "dashboard":
+            run_dashboard_cli(args)
+        elif args.command == "run":
+            run_daemon_cli(args)
         else:
             parser.error("未知指令")
     except YmzzError as exc:

@@ -43,7 +43,7 @@ PYTHONPATH=src python -m ymzz.cli paper \
 10 0 * * * cd /path/to/ymzz && PYTHONPATH=src python -m ymzz.cli paper --strategy rsi_macd --source kraken --symbol BTC/USD --timeframe 1d --size 1.0 --capital 10 >> data/paper/cron.log 2>&1
 ```
 
-狀態在 `data/paper/state.json`，決策會附加到旁邊的 CSV 與 Markdown。紙上單呼叫本機的 `kraken paper buy`、`kraken paper sell`、`kraken paper status`（krakenfx/kraken-cli，MIT）。沒有安裝 CLI 時，有訊號的那一步會失敗並留下錯誤，不會假裝成交。
+狀態在 `data/paper/state.json`，決策會附加到旁邊的 CSV 與 Markdown。若本機有 `kraken` 執行檔（krakenfx/kraken-cli，MIT），紙上單交給 `kraken paper buy`／`sell`／`status`。沒有這個執行檔時，紙上單改在純 Python 裡用 Kraken 公開最後成交價成交，手續費與滑點沿用 `--fee-bp`、`--slip-bp`。實盤單仍然要 `kraken` 執行檔，不會用模擬成交代替。
 
 `--live` 預設拒絕。要送實盤必須同時有環境變數 `KRAKEN_API_KEY`、`KRAKEN_API_SECRET` 和 `--i-confirm-live`。硬上限是本金不超過 10 美元、現貨 1 倍、買單一定附止損。程式不會印出密鑰。這份倉庫的測試沒有、也不會打實盤。入金、權限與交鑰步驟見 [Kraken 入金與 API 設定教程](docs/kraken_入金與API設定教程.md)。
 
@@ -55,6 +55,74 @@ PYTHONPATH=src python -m ymzz.telegram_bot
 ```
 
 權杖只放環境變數。不要寫進檔案或提交。機器人只回覆訊號，沒有下單指令。GMGN 執行函式會直接拋出「尚未實作」。
+
+## 安裝儀表板
+
+多端儀表臺把 Kraken 實盤、Kraken 模擬、Solana 只讀觀察放在同一頁。預設只聽 `127.0.0.1:8787`。沒有 API 金鑰時，實盤區塊顯示 `not configured`，不會連線，也不會把密鑰印出來。
+
+![多端儀表臺上半部：實盤未設定、模擬權益與決策](docs/images/dashboard-top.png)
+
+![多端儀表臺整頁：預測、回測參數、Solana 觀察與 runner 狀態](docs/images/dashboard-full.png)
+
+上面兩張是 2026-11-11 用本機紙上狀態打開的畫面。當時沒有填 API 金鑰，所以實盤是 `not configured`。Solana 觀察名單是空的。
+
+### Windows
+
+在倉庫根目錄的 PowerShell：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+.\start.bat
+```
+
+瀏覽器打開 <http://127.0.0.1:8787/> 。`install.ps1` 會建立 `.venv`、安裝依賴，並在還沒有 `.env` 時從 `.env.example` 複製。`.env` 已在 `.gitignore`。金鑰只寫在 `.env` 的 `KRAKEN_API_KEY` 與 `KRAKEN_API_SECRET`，觀察地址寫在 `SOL_WATCH_ADDRESSES`（逗號分隔的公開地址）。`start.bat` 會另開視窗跑儀表臺，並在目前視窗跑紙上 runner。
+
+### macOS 與 Linux 桌面
+
+```bash
+chmod +x install.sh start.sh
+./install.sh
+./start.sh
+```
+
+瀏覽器同樣打開 <http://127.0.0.1:8787/> 。關掉 `start.sh` 那個終端，儀表臺會一起停。想自己拆開跑：
+
+```bash
+PYTHONPATH=src python -m ymzz.cli dashboard --host 127.0.0.1 --port 8787
+PYTHONPATH=src python -m ymzz.cli run --mode paper
+```
+
+安裝成套件之後也可以用 `ymzz dashboard` 與 `ymzz run --mode paper`。只跑一輪決策（給測試或 cron）：`python -m ymzz.cli run --mode paper --once`。同一台機器上第二個 runner 會直接退出。
+
+實盤迴圈仍要金鑰與確認旗標，硬上限不變（本金不超過 10 美元、現貨 1 倍、買單附止損）：
+
+```bash
+PYTHONPATH=src python -m ymzz.cli run --mode live --i-confirm-live
+```
+
+### Linux 伺服器
+
+單元檔在 `deploy/systemd/ymzz-dashboard.service` 與 `deploy/systemd/ymzz-runner.service`。範例路徑是 `/opt/ymzz`。服務預設紙上模式，儀表臺只綁 `127.0.0.1`。
+
+```bash
+sudo mkdir -p /opt/ymzz
+sudo rsync -a --exclude .venv ./ /opt/ymzz/
+cd /opt/ymzz
+./install.sh
+# 編輯 /opt/ymzz/.env，不要把金鑰提交
+sudo cp deploy/systemd/ymzz-dashboard.service deploy/systemd/ymzz-runner.service /etc/systemd/system/
+# 若目錄不是 /opt/ymzz，改 WorkingDirectory、ExecStart，並加上 User=你的帳號
+sudo systemctl daemon-reload
+sudo systemctl enable --now ymzz-dashboard.service ymzz-runner.service
+```
+
+在自己的電腦上看畫面：
+
+```bash
+ssh -L 8787:127.0.0.1:8787 user@server
+```
+
+然後打開 <http://127.0.0.1:8787/> 。不要把儀表臺改綁到公開網址；這個程式沒有登入。
 
 ## 策略
 

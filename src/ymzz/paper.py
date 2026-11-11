@@ -162,6 +162,13 @@ def step_decision(
     bar_open = bar.open_time.isoformat()
     state = _load_state(state_path)
     now = now or datetime.now(timezone.utc)
+    if state.get("cash") is None:
+        state["cash"] = capital
+    if state.get("initial_capital") is None:
+        state["initial_capital"] = capital
+    state["sl_pct"] = sl_pct
+    state["tp_pct"] = tp_pct
+    state["daily_loss_halt_pct"] = daily_loss_halt_pct
     rsi = _last(indicators.get("rsi"), index)
     dif = _last(indicators.get("dif"), index)
     dea = _last(indicators.get("dea"), index)
@@ -181,6 +188,7 @@ def step_decision(
         _append_logs(csv_path, md_path, decision)
         state["last_bar_open"] = bar_open
         state["last_decision"] = decision
+        _snapshot_equity(state, float(decision["price"]), now)
         _save_state(state_path, state)
         decision["commands"] = commands or []
         decision["idempotent"] = False
@@ -240,11 +248,20 @@ def step_decision(
     pair = kraken_pair(symbol)
     if exit_reason:
         commands = order_commands(live=live, side="sell", pair=pair, qty=qty_held, reason=exit_reason, stop_price=None)
-        _run_all(commands, runner)
+        results = _run_all(commands, runner)
+        fill = python_fill_from_results(results)
+        exit_price = bar.close
+        if fill:
+            exit_price = float(fill["fill_price"])
+            fee = float(fill.get("fee") or 0.0)
+            state["cash"] = cash + qty_held * exit_price - fee
+            _remember_fill(state, fill)
+        else:
+            state["cash"] = cash + qty_held * exit_price
         state["qty"] = 0.0
         state["entry_fill"] = 0.0
-        state["cash"] = cash + qty_held * bar.close
-        return finish(exit_reason, "已持倉，這根已收盤 K 線觸發出場", qty_held, bar.close, commands)
+        state["stop_price"] = None
+        return finish(exit_reason, "已持倉，這根已收盤 K 線觸發出場", qty_held, exit_price, commands)
 
     want_entry = qty_held <= 0 and float(signals[index] or 0) > 0
     if want_entry and state.get("halted"):
@@ -266,14 +283,39 @@ def step_decision(
         stop = price * (1.0 - sl_pct)
         reason = f"收盤進場訊號 RSI={_fmt(rsi)} DIF={_fmt(dif)} DEA={_fmt(dea)}"
         commands = order_commands(live=live, side="buy", pair=pair, qty=qty, reason=reason, stop_price=stop)
-        _run_all(commands, runner)
+        results = _run_all(commands, runner)
+        fill = python_fill_from_results(results)
+        if fill:
+            price = float(fill["fill_price"])
+            fee = float(fill.get("fee") or 0.0)
+            notional = qty * price
+            stop = price * (1.0 - sl_pct)
+            state["cash"] = cash - notional - fee
+            _remember_fill(state, fill)
+        else:
+            state["cash"] = cash - notional
         state["qty"] = qty
         state["entry_fill"] = price
-        state["cash"] = cash - notional
         state["stop_price"] = stop
         return finish("buy", reason, qty, price, commands)
 
     return finish("hold", "這根已收盤 K 線沒有新的進出場", qty_held, bar.close, [])
+
+
+def _remember_fill(state: dict, fill: dict) -> None:
+    rows = list(state.get("sim_fills") or [])
+    rows.append(
+        {
+            "side": fill.get("side"),
+            "qty": fill.get("qty"),
+            "ticker": fill.get("ticker"),
+            "fill_price": fill.get("fill_price"),
+            "fee": fill.get("fee"),
+            "slip_bp": fill.get("slip_bp"),
+            "fee_bp": fill.get("fee_bp"),
+        }
+    )
+    state["sim_fills"] = rows[-500:]
 
 
 def _last(values, index):
@@ -283,10 +325,48 @@ def _last(values, index):
     return value
 
 
-def _run_all(commands: list[list[str]], runner) -> None:
+def _run_all(commands: list[list[str]], runner) -> list:
+    results = []
     for argv in commands:
         result = runner(argv)
         code = getattr(result, "returncode", 0)
         if code not in (0, None):
             err = getattr(result, "stderr", "") or ""
             raise ConfigError(f"Kraken 指令失敗（結束碼 {code}）：{' '.join(argv[:4])} {err[:180]}")
+        results.append(result)
+    return results
+
+
+def python_fill_from_results(results: list) -> dict | None:
+    """純 Python 紙上成交會在 stdout 放 engine=ymzz-python。kraken-cli 的輸出不採用。"""
+    for result in results:
+        raw = getattr(result, "stdout", "") or ""
+        if not str(raw).strip():
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("engine") == "ymzz-python" and payload.get("fill_price") is not None:
+            return payload
+    return None
+
+
+def _snapshot_equity(state: dict, mark: float, now: datetime) -> None:
+    cash = float(state.get("cash") or 0.0)
+    qty = float(state.get("qty") or 0.0)
+    equity = cash + qty * float(mark)
+    peak = max(float(state.get("equity_peak") or equity), equity)
+    state["equity_peak"] = peak
+    state["equity"] = equity
+    state["drawdown"] = (peak - equity) / peak if peak > 0 else 0.0
+    curve = list(state.get("equity_curve") or [])
+    curve.append(
+        {
+            "time_kst": iso_kst(now),
+            "equity": equity,
+            "drawdown": state["drawdown"],
+            "price": float(mark),
+        }
+    )
+    state["equity_curve"] = curve[-2000:]

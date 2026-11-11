@@ -317,6 +317,33 @@ PYTHONPATH=src python -m ymzz.cli paper \
 - [ ] 實盤同時帶 `--live --i-confirm-live`，本金 10，現貨，止損 5%。知道最小下單量使這次必須用約 100% 權益，也知道一筆止損約虧 0.5 美元再加手續費。
 - [ ] 知道五筆回測沒有證明優勢。
 
+## 安裝儀表板
+
+金鑰放進 `.env` 之後，可以用本機儀表臺看實盤餘額（有金鑰才連線）、紙上權益、預測，以及只讀的 Solana 公開地址。步驟與截圖在 README 的「安裝儀表板」。這裡只列會用到的命令。
+
+Windows：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+.\start.bat
+```
+
+macOS / Linux 桌面：
+
+```bash
+chmod +x install.sh start.sh
+./install.sh
+./start.sh
+```
+
+瀏覽器打開 <http://127.0.0.1:8787/> 。沒有填金鑰時，實盤區塊顯示 `not configured`。紙上 runner 不需要金鑰。沒有 `kraken` 執行檔時，紙上成交用公開報價在純 Python 裡模擬；實盤單不會改走這條模擬。
+
+撰寫當下的檢查是在 Linux 上做的：儀表臺有用紙上狀態打開並截圖；`install.ps1` 與 `start.bat` 沒有在 Windows 上執行；systemd 沒有在另一台機器上 enable。實盤私有 API 的測試使用注入的假回應，沒有用真實金鑰打 Kraken。
+
+![儀表臺：實盤未設定，模擬盤有權益與決策](images/dashboard-top.png)
+
+Linux 伺服器請用 `deploy/systemd/` 的兩個單元，並用 SSH 把 `8787` 轉到自己的電腦。不要把儀表臺暴露到公網。實盤常駐仍然要 `--mode live --i-confirm-live`，本金、現貨 1 倍與止損上限跟第 6 節一樣。
+
 ## 9. 這份教程沒有核實的事實
 
 寫這份時沒有從官方頁面讀到、因此沒有寫成步驟的項目：

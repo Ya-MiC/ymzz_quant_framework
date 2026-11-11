@@ -27,6 +27,7 @@ dev = ["pytest>=8.0"]
 ymzz-web = "ymzz.api:main"
 ymzz-examples = "ymzz.examples:main"
 ymzz-cli = "ymzz.cli:main"
+ymzz = "ymzz.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
