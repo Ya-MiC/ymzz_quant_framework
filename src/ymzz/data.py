@@ -1,0 +1,917 @@
+"""公開、免金鑰的行情適配器。任一來源失敗就停止，不悄悄換下一個。"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+
+from ymzz.catalog import get_market
+from ymzz.engine import Bar, Funding, apply_ashare_limits, ashare_price_limit_rate
+from ymzz.errors import ConfigError, DataGapError, DataSourceError, StockAppUnidentified
+from ymzz.http_cache import DataClient
+from ymzz.timeutil import CST, UTC, ensure_utc
+
+OKX_BAR = {"1d": "1D", "4h": "4H", "1h": "1H", "15m": "15m"}
+BINANCE_INTERVAL = {"1d": "1d", "4h": "4h", "1h": "1h", "15m": "15m"}
+KRAKEN_MINUTES = {"1d": 1440, "4h": 240, "1h": 60, "15m": 15, "5m": 5, "1m": 1}
+DURATION = {
+    "1d": timedelta(days=1),
+    "4h": timedelta(hours=4),
+    "1h": timedelta(hours=1),
+    "15m": timedelta(minutes=15),
+    "5m": timedelta(minutes=5),
+    "1m": timedelta(minutes=1),
+}
+
+
+def _dt_ms(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000.0, tz=UTC)
+
+
+def _dt_s(sec: int) -> datetime:
+    return datetime.fromtimestamp(sec, tz=UTC)
+
+
+def _parse_date(text: str, tz) -> datetime:
+    day = datetime.strptime(text[:10], "%Y-%m-%d")
+    return day.replace(tzinfo=tz)
+
+
+def _ashare_bar(day: str, open_, high, low, close, volume, quote, now: datetime) -> Bar:
+    start = _parse_date(day, CST).replace(hour=9, minute=30)
+    end = _parse_date(day, CST).replace(hour=15, minute=0)
+    closed = ensure_utc(now) >= ensure_utc(end)
+    return Bar(
+        ensure_utc(start),
+        ensure_utc(end),
+        float(open_),
+        float(high),
+        float(low),
+        float(close),
+        None if volume is None else float(volume),
+        None if quote is None else float(quote),
+        closed,
+    )
+
+
+def parse_sina(payload, now: datetime) -> tuple[list[Bar], int]:
+    if not isinstance(payload, list):
+        raise DataSourceError("新浪回應不是 K 線陣列")
+    bars = []
+    for row in payload:
+        bars.append(
+            _ashare_bar(row["day"], row["open"], row["high"], row["low"], row["close"], row.get("volume"), None, now)
+        )
+    return _finish_bars(bars, "Asia/Shanghai", "新浪日線沒有復權參數，不把這份資料稱作前復權。成交量單位是股，沒有成交額。")
+
+
+def parse_tencent(payload, symbol: str, now: datetime) -> tuple[list[Bar], dict]:
+    if payload.get("code") not in (0, "0"):
+        raise DataSourceError(f"騰訊回應 code={payload.get('code')}，沒有改問新浪。")
+    node = (payload.get("data") or {}).get(symbol) or {}
+    rows = node.get("qfqday") or node.get("day")
+    if not rows:
+        raise DataSourceError("騰訊沒有回傳日線")
+    adjust = "qfq" if node.get("qfqday") else "none"
+    bars = []
+    for row in rows:
+        # 日期、開、收、高、低、量（手）
+        shares = float(row[5]) * 100.0
+        bars.append(_ashare_bar(row[0], row[1], row[3], row[4], row[2], shares, None, now))
+    bars, dropped = _split_closed(bars)
+    meta = {
+        "timezone": "Asia/Shanghai",
+        "adjust": adjust,
+        "volume_unit": "share",
+        "volume_unit_original": "lot_100",
+        "dropped_unclosed": dropped,
+        "note_zh": "騰訊這次請求的是前復權。成交量由手換算成股（×100），沒有成交額。",
+    }
+    return bars, meta
+
+
+def parse_eastmoney(payload, now: datetime) -> tuple[list[Bar], dict]:
+    if payload.get("rc") not in (0, "0"):
+        raise DataSourceError(f"東財 rc={payload.get('rc')}，沒有更換主機重試。")
+    rows = ((payload.get("data") or {}).get("klines")) or []
+    if not rows:
+        raise DataSourceError("東財沒有回傳 K 線")
+    bars = []
+    for line in rows:
+        parts = line.split(",")
+        shares = float(parts[5]) * 100.0
+        amount = float(parts[6])
+        # 日期、開、收、高、低、量（手）、成交額
+        bars.append(_ashare_bar(parts[0], parts[1], parts[3], parts[4], parts[2], shares, amount, now))
+    bars, dropped = _split_closed(bars)
+    meta = {
+        "timezone": "Asia/Shanghai",
+        "adjust": "qfq",
+        "fqt": 1,
+        "volume_unit": "share",
+        "volume_unit_original": "lot_100",
+        "dropped_unclosed": dropped,
+        "note_zh": "東財 fqt=1 為前復權。量是手，已×100 成股；成交額沿用來源的金額。",
+    }
+    return bars, meta
+
+
+def _split_closed(bars: list[Bar]) -> tuple[list[Bar], int]:
+    closed = [bar for bar in bars if bar.closed and bar.high >= bar.low and bar.open > 0 and bar.close > 0]
+    dropped = len(bars) - len(closed)
+    closed.sort(key=lambda bar: bar.open_time)
+    dedup = {}
+    for bar in closed:
+        dedup[bar.open_time] = bar
+    return [dedup[key] for key in sorted(dedup)], dropped
+
+
+def _finish_bars(bars: list[Bar], tz: str, note: str):
+    closed, dropped = _split_closed(bars)
+    return closed, {"timezone": tz, "dropped_unclosed": dropped, "note_zh": note}
+
+
+def parse_okx_candles(payload, timeframe: str, now: datetime) -> tuple[list[Bar], dict]:
+    if str(payload.get("code")) != "0":
+        raise DataSourceError(f"OKX code={payload.get('code')} {payload.get('msg')}，沒有改走幣安。")
+    duration = DURATION[timeframe]
+    bars = []
+    dropped = 0
+    for row in payload.get("data") or []:
+        opened = _dt_ms(int(row[0]))
+        confirm = str(row[8]) if len(row) > 8 else ""
+        is_closed = confirm == "1" if confirm != "" else ensure_utc(now) >= opened + duration
+        if not is_closed:
+            dropped += 1
+            continue
+        quote = float(row[7]) if len(row) > 7 else None
+        bars.append(
+            Bar(opened, opened + duration, float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]), quote, True)
+        )
+    bars, extra = _split_closed(bars)
+    tz = "Asia/Shanghai" if timeframe == "1d" else "UTC"
+    return bars, {
+        "timezone": tz,
+        "dropped_unclosed": dropped + extra,
+        "note_zh": "OKX 日線以 UTC+8 0 點切開，和幣安／Kraken 的 UTC 日線不同。confirm=0 的未收盤 K 已剔除。數量後續用幣價換算，不用合約張數當持倉。",
+    }
+
+
+def parse_okx_funding(payload) -> list[Funding]:
+    if str(payload.get("code")) != "0":
+        raise DataSourceError(f"OKX 資金費 code={payload.get('code')}，永續回測因此停止，不會把資金費當 0。")
+    events = []
+    for row in payload.get("data") or []:
+        rate = row.get("fundingRate")
+        when = row.get("fundingTime")
+        if rate is None or when is None:
+            continue
+        events.append(Funding(_dt_ms(int(when)), float(rate)))
+    events.sort(key=lambda item: item.time)
+    return events
+
+
+def parse_binance_klines(payload, timeframe: str, now: datetime) -> tuple[list[Bar], dict]:
+    if isinstance(payload, dict) and payload.get("code") not in (None, 0):
+        raise DataSourceError(
+            f"幣安拒絕這次請求：{payload.get('msg') or payload}",
+            status_code=payload.get("code"),
+        )
+    if not isinstance(payload, list):
+        raise DataSourceError("幣安 K 線不是陣列，沒有改用其他交易所。")
+    duration = DURATION[timeframe]
+    bars = []
+    dropped = 0
+    for row in payload:
+        opened = _dt_ms(int(row[0]))
+        close_time = _dt_ms(int(row[6]))
+        if ensure_utc(now) < close_time or ensure_utc(now) < opened + duration:
+            dropped += 1
+            continue
+        bars.append(
+            Bar(
+                opened,
+                opened + duration,
+                float(row[1]),
+                float(row[2]),
+                float(row[3]),
+                float(row[4]),
+                float(row[5]),
+                float(row[7]),
+                True,
+            )
+        )
+    bars, extra = _split_closed(bars)
+    return bars, {
+        "timezone": "UTC",
+        "dropped_unclosed": dropped + extra,
+        "note_zh": "幣安日線以 UTC 0 點切開。未收盤的最後一根已剔除。",
+    }
+
+
+def parse_binance_funding(payload) -> list[Funding]:
+    if isinstance(payload, dict):
+        raise DataSourceError(f"幣安資金費失敗：{payload.get('msg') or payload}。不會改用 OKX 的資金費。")
+    return [Funding(_dt_ms(int(row["fundingTime"])), float(row["fundingRate"])) for row in payload]
+
+
+def paginate_binance_funding(fetch, start_ms: int, end_ms: int, limit: int = 1000, max_pages: int = 20):
+    """fetch(params) 必須帶 startTime 與 endTime。不帶時間時幣安只回最近約 200 筆。"""
+    start_ms = int(start_ms)
+    end_ms = int(end_ms)
+    if start_ms > end_ms:
+        return [], False
+    cursor = start_ms
+    rows: list[dict] = []
+    seen: set[int] = set()
+    incomplete = False
+    for _ in range(max_pages):
+        params = {"startTime": str(cursor), "endTime": str(end_ms), "limit": str(limit)}
+        batch = fetch(params) or []
+        if isinstance(batch, dict):
+            raise DataSourceError(f"幣安資金費失敗：{batch.get('msg') or batch}。不會改用 OKX 的資金費。")
+        if not batch:
+            break
+        for row in batch:
+            ts = int(row["fundingTime"])
+            if ts in seen or ts < start_ms or ts > end_ms:
+                continue
+            seen.add(ts)
+            rows.append(row)
+        last = max(int(row["fundingTime"]) for row in batch)
+        if len(batch) < limit:
+            break
+        nxt = last + 1
+        if nxt <= cursor or nxt > end_ms:
+            incomplete = last < end_ms
+            break
+        cursor = nxt
+    else:
+        if not rows or max(int(row["fundingTime"]) for row in rows) < end_ms:
+            incomplete = True
+    rows.sort(key=lambda row: int(row["fundingTime"]))
+    return rows, incomplete
+
+
+def parse_kraken_ohlc(payload, timeframe: str, now: datetime) -> tuple[list[Bar], dict]:
+    if payload.get("error"):
+        raise DataSourceError(f"Kraken 錯誤：{payload.get('error')}")
+    result = payload.get("result") or {}
+    raw_last = result.get("last")
+    last_id = int(raw_last) if raw_last not in (None, "") else None
+    rows = None
+    for key, value in result.items():
+        if key != "last":
+            rows = value
+            break
+    if not rows:
+        raise DataSourceError("Kraken 沒有 OHLC")
+    duration = DURATION[timeframe]
+    bars = []
+    dropped = 0
+    for row in rows:
+        opened = _dt_s(int(row[0]))
+        if last_id is not None and int(row[0]) > last_id:
+            dropped += 1
+            continue
+        if ensure_utc(now) < opened + duration:
+            dropped += 1
+            continue
+        bars.append(
+            Bar(opened, opened + duration, float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[6]), None, True)
+        )
+    bars, extra = _split_closed(bars)
+    return bars, {
+        "timezone": "UTC",
+        "dropped_unclosed": dropped + extra,
+        "note_zh": "Kraken 以 UTC 切開。公開 OHLC 約 720 根，count 參數不可靠。last 之後與尚未走完的 K 線都剔除。沒有成交額。",
+        "kraken_last": last_id,
+    }
+
+
+def parse_kraken_asset_pairs(payload) -> dict:
+    """Kraken 公開 AssetPairs。最小下單量只採用回應裡的數字，不寫死。"""
+    if payload.get("error"):
+        raise DataSourceError(f"Kraken AssetPairs 錯誤：{payload.get('error')}。沒有用寫死的最小量代替。")
+    result = payload.get("result") or {}
+    if not result:
+        raise DataSourceError("Kraken AssetPairs 是空的。沒有用寫死的最小量代替。")
+    key = next(iter(result))
+    info = result[key]
+    try:
+        limits = {
+            "result_key": key,
+            "wsname": info.get("wsname"),
+            "altname": info.get("altname"),
+            "ordermin": float(info["ordermin"]),
+            "costmin": float(info["costmin"]),
+            "lot_decimals": int(info["lot_decimals"]),
+            "status": info.get("status"),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DataSourceError("Kraken AssetPairs 缺少 ordermin、costmin 或 lot_decimals。沒有用估計值填補。") from exc
+    return limits
+
+
+KRAKEN_SPOT_PAIRS = {
+    ("BTC", "USD"): "XBTUSD",
+    ("ETH", "USD"): "ETHUSD",
+    ("SOL", "USD"): "SOLUSD",
+    ("BTC", "USDC"): "XBTUSDC",
+    ("ETH", "USDC"): "ETHUSDC",
+    ("SOL", "USDC"): "SOLUSDC",
+}
+
+
+def kraken_rest_pair(symbol: str) -> str:
+    base, quote = _split_symbol(symbol)
+    try:
+        return KRAKEN_SPOT_PAIRS[(base, quote)]
+    except KeyError as exc:
+        raise ConfigError("Kraken 現貨只接 BTC、ETH、SOL 的 USD 或 USDC。沒有對過的代碼不會猜。") from exc
+
+
+FUTURES_MARKET = {
+    "BTC/USD": "PF_XBTUSD",
+    "ETH/USD": "PF_ETHUSD",
+    "SOL/USD": "PF_SOLUSD",
+}
+FUTURES_DECIMALS = {"PF_XBTUSD": 4, "PF_ETHUSD": 3, "PF_SOLUSD": 2}
+
+
+def parse_kraken_futures_candles(payload, timeframe: str, now: datetime) -> tuple[list[Bar], dict]:
+    candles = payload.get("candles") if isinstance(payload, dict) else None
+    if not candles:
+        raise DataSourceError("Kraken 期貨沒有 K 線")
+    duration = DURATION[timeframe]
+    bars = []
+    dropped = 0
+    for row in candles:
+        opened = _dt_ms(int(row["time"]))
+        if ensure_utc(now) < opened + duration:
+            dropped += 1
+            continue
+        bars.append(
+            Bar(
+                opened,
+                opened + duration,
+                float(row["open"]),
+                float(row["high"]),
+                float(row["low"]),
+                float(row["close"]),
+                float(row.get("volume") or 0.0),
+                None,
+                True,
+            )
+        )
+    return bars, {
+        "timezone": "UTC",
+        "dropped_unclosed": dropped,
+        "note_zh": "這是 Kraken 線性永續的成交 K 線，不是現貨 OHLC。未收盤的最後一根已剔除。",
+    }
+
+
+def parse_kraken_funding_rates(payload) -> list[Funding]:
+    if not isinstance(payload, dict) or payload.get("result") not in (None, "success"):
+        raise DataSourceError("Kraken 資金費回應不是 success")
+    rates = payload.get("rates")
+    if not isinstance(rates, list) or not rates:
+        raise DataSourceError("Kraken 資金費是空的。沒有用 0 填。")
+    events = []
+    for row in rates:
+        stamp = str(row["timestamp"]).replace("Z", "+00:00")
+        events.append(Funding(datetime.fromisoformat(stamp), float(row["relativeFundingRate"])))
+    events.sort(key=lambda item: item.time)
+    return events
+
+
+def load_kraken_futures(client: DataClient, symbol: str, timeframe: str, now: datetime) -> tuple[list[Bar], list[Funding], dict]:
+    try:
+        market = FUTURES_MARKET[symbol]
+    except KeyError as exc:
+        raise ConfigError("期貨回測只接 BTC/USD、ETH/USD、SOL/USD 的線性永續。沒有對過的代碼不會猜。") from exc
+    candle_url = f"https://futures.kraken.com/api/charts/v1/trade/{market}/{timeframe}"
+    candles, candle_prov = client.get_json(candle_url, None, mode="live")
+    bars, extra = parse_kraken_futures_candles(candles, timeframe, now)
+    fund_url = "https://futures.kraken.com/derivatives/api/v4/historicalfundingrates"
+    funding_payload, fund_prov = client.get_json(fund_url, {"symbol": market}, mode="live")
+    funding = parse_kraken_funding_rates(funding_payload)
+    extra["futures_symbol"] = market
+    extra["lot_decimals"] = FUTURES_DECIMALS[market]
+    extra["funding_first"] = funding[0].time.isoformat()
+    extra["funding_last"] = funding[-1].time.isoformat()
+    extra["funding_points"] = len(funding)
+    extra["candle_sha256"] = candle_prov.get("sha256")
+    extra["funding_sha256"] = fund_prov.get("sha256")
+    extra["note_zh"] += " 資金費用 relativeFundingRate，每小時一筆。這段序列開始之前沒有用 0 填。"
+    return bars, funding, extra
+
+
+def merge_futures_bars(bars: list[Bar], duration: timedelta) -> tuple[list[Bar], list[dict]]:
+    """依開盤時間合併。同一根價格不一致就停止。中間有缺口時，只留下最靠近現在、而且連續的那一段。缺口不補 0。"""
+    ordered = sorted(bars, key=lambda bar: bar.open_time)
+    merged: list[Bar] = []
+    for bar in ordered:
+        if merged and merged[-1].open_time == bar.open_time:
+            prev = merged[-1]
+            for name in ("open", "high", "low", "close"):
+                if abs(float(getattr(prev, name)) - float(getattr(bar, name))) > 1e-6:
+                    raise DataSourceError("同一根期貨 K 線兩次抓到的價格不一樣。沒有合併，也沒有挑較好看的一根。")
+            continue
+        merged.append(bar)
+    gaps = []
+    start = 0
+    for i in range(1, len(merged)):
+        if merged[i].open_time - merged[i - 1].open_time > duration * 1.5:
+            gaps.append(
+                {
+                    "after": merged[i - 1].open_time.isoformat(),
+                    "before": merged[i].open_time.isoformat(),
+                }
+            )
+            start = i
+    return merged[start:], gaps
+
+
+def load_kraken_futures_history(
+    client: DataClient,
+    symbol: str,
+    timeframe: str,
+    now: datetime,
+    earliest: datetime,
+) -> tuple[list[Bar], list[Funding], dict]:
+    """往前翻公開圖表。`from` 回的是從那個時刻往後最多 2000 根，所以用更早的起點去接。接不起來的洞不填。"""
+    try:
+        market = FUTURES_MARKET[symbol]
+    except KeyError as exc:
+        raise ConfigError("期貨回測只接 BTC/USD、ETH/USD、SOL/USD 的線性永續。沒有對過的代碼不會猜。") from exc
+    duration = DURATION[timeframe]
+    url = f"https://futures.kraken.com/api/charts/v1/trade/{market}/{timeframe}"
+    collected: list[Bar] = []
+    pages = 0
+    cursor = None
+    last_oldest = None
+    latest_sha = None
+    for _ in range(8):
+        params = None if cursor is None else {"from": str(cursor)}
+        payload, prov = client.get_json(url, params, mode="live")
+        try:
+            page, _extra = parse_kraken_futures_candles(payload, timeframe, now)
+        except DataSourceError:
+            if collected:
+                break
+            raise
+        pages += 1
+        if cursor is None:
+            latest_sha = prov.get("sha256")
+        if not page:
+            break
+        collected.extend(page)
+        oldest = min(bar.open_time for bar in page)
+        if last_oldest is not None and oldest >= last_oldest:
+            break
+        last_oldest = oldest
+        if oldest <= earliest:
+            break
+        cursor = int((oldest - duration * 1990).timestamp())
+    bars, gaps = merge_futures_bars(collected, duration)
+    fund_url = "https://futures.kraken.com/derivatives/api/v4/historicalfundingrates"
+    funding_payload, fund_prov = client.get_json(fund_url, {"symbol": market}, mode="live")
+    funding = parse_kraken_funding_rates(funding_payload)
+    meta = {
+        "futures_symbol": market,
+        "lot_decimals": FUTURES_DECIMALS[market],
+        "pages": pages,
+        "gaps": gaps,
+        "dropped_before_gap": bool(gaps),
+        "funding_first": funding[0].time.isoformat(),
+        "funding_last": funding[-1].time.isoformat(),
+        "funding_points": len(funding),
+        "funding_sha256": fund_prov.get("sha256"),
+        "latest_page_sha256": latest_sha,
+        "note_zh": "Kraken 線性永續成交 K 線。往前翻頁接上；價格不一致或中間缺根就停止補洞。資金費只用 relativeFundingRate。",
+    }
+    return bars, funding, meta
+
+
+def load_kraken_limits(client: DataClient, mode: str = "live", pair: str = "XBTUSD") -> tuple[dict, dict]:
+    payload, prov = client.get_json("https://api.kraken.com/0/public/AssetPairs", {"pair": pair}, mode=mode)
+    limits = parse_kraken_asset_pairs(payload)
+    limits["source_url"] = prov.get("source_url")
+    limits["fetched_at_utc"] = prov.get("fetched_at_utc")
+    limits["fetched_at_kst"] = prov.get("fetched_at_kst")
+    limits["sha256"] = prov.get("sha256")
+    return limits, prov
+
+
+def parse_gecko_ohlcv(payload, timeframe: str, now: datetime) -> tuple[list[Bar], dict]:
+    rows = (((payload.get("data") or {}).get("attributes") or {}).get("ohlcv_list")) or []
+    if not rows:
+        raise DataSourceError("GeckoTerminal 沒有 OHLCV，沒有改用 Dexscreener 的現況快照充當歷史。")
+    duration = DURATION[timeframe]
+    bars = []
+    dropped = 0
+    for row in rows:
+        opened = _dt_s(int(row[0]))
+        if ensure_utc(now) < opened + duration:
+            dropped += 1
+            continue
+        bars.append(
+            Bar(opened, opened + duration, float(row[1]), float(row[2]), float(row[3]), float(row[4]), None, float(row[5]), True)
+        )
+    bars, extra = _split_closed(bars)
+    meta_attr = payload.get("meta") or {}
+    return bars, {
+        "timezone": "UTC",
+        "dropped_unclosed": dropped + extra,
+        "base": (meta_attr.get("base") or {}).get("symbol"),
+        "quote": (meta_attr.get("quote") or {}).get("symbol"),
+        "note_zh": "GeckoTerminal 池 K 線。成交量欄是美元成交額。熱榜池有生存者偏差，這條序列不是當時可交易全集。",
+    }
+
+
+def parse_polymarket_history(payload, now: datetime) -> tuple[list[Bar], dict]:
+    if isinstance(payload, dict) and payload.get("error"):
+        raise DataSourceError(f"Polymarket 歷史價錯誤：{payload.get('error')}。沒有編造價格。")
+    history = payload.get("history") if isinstance(payload, dict) else None
+    if not history:
+        raise DataSourceError("Polymarket prices-history 是空的。拒絕用當前報價補成歷史曲線。")
+    bars = []
+    for row in history:
+        when = _dt_s(int(row["t"]))
+        if ensure_utc(when) > ensure_utc(now):
+            continue
+        price = float(row["p"])
+        bars.append(Bar(when, when, price, price, price, price, None, None, True))
+    bars, dropped = _split_closed(bars)
+    return bars, {
+        "timezone": "UTC",
+        "dropped_unclosed": dropped,
+        "bar_kind": "price_point",
+        "note_zh": "這是價格點，高=低=收，沒有日內高低。止盈止損只能看點是否穿過，不能假裝有 K 線影線。市值不是事件結算賠付。",
+    }
+
+
+def _split_symbol(symbol: str) -> tuple[str, str]:
+    text = symbol.replace("-", "/").upper()
+    if "/" in text:
+        base, quote = text.split("/", 1)
+        return base, quote
+    for quote in ("USDT", "USDC", "USD"):
+        if text.endswith(quote) and len(text) > len(quote):
+            return text[: -len(quote)], quote
+    raise ConfigError(f"無法拆開交易對：{symbol}")
+
+
+def _range_filter(bars: list[Bar], start: datetime | None, end: datetime | None, tz_name: str) -> list[Bar]:
+    tz = CST if tz_name == "Asia/Shanghai" else UTC
+    kept = []
+    for bar in bars:
+        local_day = bar.open_time.astimezone(tz).date()
+        if start is not None and local_day < start.astimezone(tz).date():
+            continue
+        if end is not None and local_day > end.astimezone(tz).date():
+            continue
+        kept.append(bar)
+    return kept
+
+
+def _require_coverage(bars: list[Bar], start: datetime | None, tz_name: str, source: str):
+    if not bars:
+        raise DataSourceError(f"{source} 在剔除未收盤之後沒有 K 線")
+    if start is None:
+        return
+    tz = CST if tz_name == "Asia/Shanghai" else UTC
+    earliest = bars[0].open_time.astimezone(tz).date()
+    if earliest > start.astimezone(tz).date():
+        raise DataGapError(
+            f"{source} 最早只有 {earliest.isoformat()}，早於請求起點 {start.astimezone(tz).date().isoformat()} 的部分不存在。沒有用別的來源補洞。",
+            earliest=earliest.isoformat(),
+            latest=bars[-1].open_time.astimezone(tz).date().isoformat(),
+        )
+
+
+def _date(text: str | None, tz) -> datetime | None:
+    if not text:
+        return None
+    return datetime.strptime(text[:10], "%Y-%m-%d").replace(tzinfo=tz)
+
+
+class StockAppAdapter:
+    """身分未定的佔位。不要在這裡接 yfinance。"""
+
+    market_id = "stock_app"
+
+    def load(self, *_args, **_kwargs):
+        raise StockAppUnidentified(
+            "Stock App 打金狗的產品身分還沒有被指認。請提供官方網址、商店頁或 Telegram 機器人名稱。"
+            "在那之前，這個適配器不會用 yfinance、A 股行情或 GMGN 來頂替，也不會產生假回測。"
+        )
+
+
+def load_market(spec: dict, client: DataClient, now: datetime | None = None):
+    now = now or datetime.now(UTC)
+    market = spec["market"]
+    if market == "stock_app":
+        raise StockAppUnidentified(
+            "Stock App 打金狗的產品身分還沒有被指認。請提供官方網址、商店頁或 Telegram 機器人名稱。"
+            "在那之前不會用 yfinance、A 股或 GMGN 頂替。"
+        )
+    try:
+        meta_market = get_market(market)
+    except KeyError as exc:
+        raise ConfigError(f"沒有這個市場：{market}") from exc
+    source = spec.get("source") or meta_market["default_source"]
+    if source not in meta_market["sources"]:
+        raise ConfigError(f"{meta_market['label_zh']} 沒有來源 {source}。失敗時也不會自動改接別的來源。")
+    timeframe = spec.get("timeframe") or "1d"
+    if timeframe not in meta_market["timeframes"]:
+        raise ConfigError(f"這個市場目前沒有週期 {timeframe}。A 股只做已核對的日線，不會做成分鐘假資料。")
+    mode = spec.get("data_mode") or "live"
+    start = _date(spec.get("start"), CST if market == "ashare" else UTC)
+    end = _date(spec.get("end"), CST if market == "ashare" else UTC)
+    if market == "ashare":
+        bars, extra, prov = _load_ashare(source, spec["symbol"], start, end, client, now, mode, spec.get("source_host"))
+        funding: list[Funding] = []
+    elif market in {"crypto_spot", "crypto_perp"}:
+        instrument = "perpetual" if market == "crypto_perp" else "spot"
+        bars, funding, extra, prov = _load_crypto(
+            source, spec["symbol"], timeframe, instrument, start, end, client, now, mode, spec.get("ccxt_exchange")
+        )
+    elif market == "solana_pool":
+        bars, extra, prov = _load_gecko(spec["symbol"], timeframe, start, end, client, now, mode)
+        funding = []
+    elif market == "polymarket":
+        bars, extra, prov = _load_polymarket(spec["symbol"], start, end, client, now, mode, spec.get("adapter"))
+        funding = []
+    else:
+        raise ConfigError(f"沒有這個市場：{market}")
+    tz_name = extra.get("timezone") or "UTC"
+    if spec.get("strict_range", True):
+        _require_coverage(bars, start, tz_name, source)
+    bars = _range_filter(bars, start, end, tz_name)
+    if not bars:
+        raise DataSourceError(f"{source} 在請求區間內沒有已收盤 K 線")
+    provenance = {**prov, **extra, "source": source, "market": market, "symbol": spec.get("symbol"), "timeframe": timeframe}
+    return bars, funding, provenance
+
+
+def _load_ashare(source, symbol, start, end, client: DataClient, now, mode, host):
+    code = symbol.lower().replace("sh", "").replace("sz", "")
+    if not code.isdigit() or len(code) != 6:
+        raise ConfigError("A 股代碼請用 6 位數字，例如 600519")
+    prefix = "sh" if code.startswith(("5", "6", "9")) else "sz"
+    if code.startswith(("4", "8")):
+        raise ConfigError("這版只接滬深 6 位股票代碼，北交所沒有核對過，所以不猜。")
+    limit = 500
+    if source == "sina":
+        url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+        params = {"symbol": f"{prefix}{code}", "scale": "240", "ma": "no", "datalen": str(limit)}
+        payload, prov = client.get_json(url, params, mode=mode, headers={"Referer": "https://finance.sina.com.cn"})
+        bars, extra = parse_sina(payload, now)
+        return _stamp_ashare(code, symbol, bars, extra), extra, prov
+    if source == "tencent":
+        url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        params = {"param": f"{prefix}{code},day,,,{limit},qfq"}
+        payload, prov = client.get_json(url, params, mode=mode)
+        bars, extra = parse_tencent(payload, f"{prefix}{code}", now)
+        return _stamp_ashare(code, symbol, bars, extra), extra, prov
+    if source == "eastmoney":
+        host = host or "80.push2his.eastmoney.com"
+        allowed = {"80.push2his.eastmoney.com", "92.push2his.eastmoney.com", "push2his.eastmoney.com"}
+        if host not in allowed:
+            raise ConfigError("東財主機不在允許清單。不會自動輪詢其他主機。")
+        market = "1" if prefix == "sh" else "0"
+        url = f"https://{host}/api/qt/stock/kline/get"
+        params = {
+            "secid": f"{market}.{code}",
+            "klt": "101",
+            "fqt": "1",
+            "lmt": str(limit),
+            "end": "20500101",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        }
+        payload, prov = client.get_json(url, params, mode=mode, headers={"User-Agent": "Mozilla/5.0"})
+        bars, extra = parse_eastmoney(payload, now)
+        extra["host"] = host
+        return _stamp_ashare(code, symbol, bars, extra), extra, prov
+    raise ConfigError(f"沒有這個 A 股來源：{source}")
+
+
+def _stamp_ashare(code: str, symbol: str, bars: list[Bar], extra: dict) -> list[Bar]:
+    rate = ashare_price_limit_rate(code, st="ST" in symbol.upper())
+    apply_ashare_limits(bars, rate)
+    extra["limit_rate"] = rate
+    extra["note_zh"] = extra.get("note_zh", "") + (
+        f" 漲跌停依前收計算，幅度 {rate:.0%}（ST 5%，創業板 300/301 與科創板 688/689 為 20%，其餘主板 10%）。"
+        "買進不越過漲停、賣出不越過跌停。停牌日要標 suspended 才不會成交；來源沒有這面旗標時，不把成交量 0 猜成停牌。"
+    )
+    return bars
+
+
+def _paginate(fetch_page, newest_first_ts):
+    rows = []
+    cursor = None
+    for _ in range(12):
+        page = fetch_page(cursor)
+        if not page:
+            break
+        rows.extend(page)
+        oldest = min(newest_first_ts(row) for row in page)
+        if cursor == oldest:
+            break
+        cursor = oldest
+        if len(page) < 90:
+            break
+    return rows
+
+
+def _load_crypto(source, symbol, timeframe, instrument, start, end, client: DataClient, now, mode, ccxt_exchange=None):
+    base, quote = _split_symbol(symbol)
+    if source == "kraken":
+        if instrument != "spot":
+            raise ConfigError("Kraken 這版只有現貨 OHLC，不會把現貨當成永續。")
+        pair = kraken_rest_pair(symbol)
+        url = "https://api.kraken.com/0/public/OHLC"
+        params = {"pair": pair, "interval": str(KRAKEN_MINUTES[timeframe])}
+        if start is not None:
+            params["since"] = str(int(start.timestamp()))
+        payload, prov = client.get_json(url, params, mode=mode)
+        bars, extra = parse_kraken_ohlc(payload, timeframe, now)
+        if start is not None and bars and bars[0].open_time.date() > start.date():
+            extra["history_short"] = True
+            extra["note_zh"] = extra.get("note_zh", "") + " 公開 OHLC 大約只留 720 根。更早的日子這支 API 沒有，沒有用別的來源補。"
+        return bars, [], extra, prov
+    if source == "okx":
+        if timeframe not in OKX_BAR:
+            raise ConfigError(f"OKX 這支沒有接 {timeframe}。沒有改走別的交易所。")
+        inst = f"{base}-{quote}" + ("-SWAP" if instrument == "perpetual" else "")
+        bar = OKX_BAR[timeframe]
+
+        def fetch_page(after):
+            params = {"instId": inst, "bar": bar, "limit": "100"}
+            if after is not None:
+                params["after"] = str(after)
+            payload, prov = client.get_json("https://www.okx.com/api/v5/market/history-candles", params, mode=mode)
+            fetch_page.prov = prov
+            if str(payload.get("code")) != "0":
+                raise DataSourceError(f"OKX K 線失敗：{payload.get('msg')}。沒有改走幣安。")
+            return payload.get("data") or []
+
+        fetch_page.prov = {}
+        raw_rows = _paginate(fetch_page, lambda row: int(row[0]))
+        bars, extra = parse_okx_candles({"code": "0", "data": raw_rows}, timeframe, now)
+        funding: list[Funding] = []
+        if instrument == "perpetual":
+            def fetch_funding(after):
+                params = {"instId": inst, "limit": "100"}
+                if after is not None:
+                    params["after"] = str(after)
+                payload, prov = client.get_json("https://www.okx.com/api/v5/public/funding-rate-history", params, mode=mode)
+                fetch_funding.prov = prov
+                return parse_okx_funding(payload), payload.get("data") or []
+
+            fetch_funding.prov = {}
+            events: list[Funding] = []
+            cursor = None
+            for _ in range(15):
+                parsed, raw = fetch_funding(cursor)
+                if not raw:
+                    break
+                events.extend(parsed)
+                oldest = min(int(row["fundingTime"]) for row in raw)
+                if cursor == oldest:
+                    break
+                cursor = oldest
+                if len(raw) < 90:
+                    break
+            # 去重
+            uniq = {item.time: item for item in events}
+            funding = [uniq[key] for key in sorted(uniq)]
+            if not funding:
+                raise DataSourceError("永續模式沒有拿到任何資金費，已停止。不會只拿 K 線把資金費當 0。")
+            extra["funding_points"] = len(funding)
+            extra["funding_sha256"] = fetch_funding.prov.get("sha256")
+            if bars and funding and funding[0].time > bars[0].open_time + DURATION[timeframe]:
+                extra["funding_gap"] = True
+                extra["note_zh"] = extra.get("note_zh", "") + " 資金費歷史比 K 線短，較早的持倉沒有被填 0，只是沒有事件可扣。"
+        return bars, funding, extra, fetch_page.prov
+    if source == "binance":
+        if timeframe not in BINANCE_INTERVAL:
+            raise ConfigError(f"Binance 這支沒有接 {timeframe}。沒有改走別的交易所。")
+        pair = f"{base}{quote}"
+        interval = BINANCE_INTERVAL[timeframe]
+        host = "https://fapi.binance.com" if instrument == "perpetual" else "https://api.binance.com"
+        path = "/fapi/v1/klines" if instrument == "perpetual" else "/api/v3/klines"
+        payload, prov = client.get_json(host + path, {"symbol": pair, "interval": interval, "limit": "1000"}, mode=mode)
+        bars, extra = parse_binance_klines(payload, timeframe, now)
+        funding = []
+        if instrument == "perpetual":
+            if not bars:
+                raise DataSourceError("幣安永續沒有已收盤 K 線，無法決定資金費區間。")
+            start_ms = int(bars[0].open_time.timestamp() * 1000)
+            end_ms = int(bars[-1].close_time.timestamp() * 1000)
+
+            def fetch_funding(params):
+                payload, prov = client.get_json(
+                    "https://fapi.binance.com/fapi/v1/fundingRate",
+                    {"symbol": pair, **params},
+                    mode=mode,
+                )
+                fetch_funding.prov = prov
+                return payload
+
+            fetch_funding.prov = {}
+            rows, incomplete = paginate_binance_funding(fetch_funding, start_ms, end_ms)
+            funding = parse_binance_funding(rows)
+            if not funding:
+                raise DataSourceError("幣安永續沒有資金費，已停止。不會只拿最近一頁把較早的資金費漏掉。")
+            extra["funding_sha256"] = fetch_funding.prov.get("sha256")
+            extra["funding_points"] = len(funding)
+            short_history = funding[0].time > bars[0].open_time + DURATION[timeframe]
+            if incomplete or short_history:
+                extra["funding_gap"] = True
+                extra["note_zh"] = extra.get("note_zh", "") + " 資金費沒有蓋滿這段 K 線。較早的持倉沒有被填 0，只是沒有事件可扣。"
+        return bars, funding, extra, prov
+    if source == "ccxt":
+        from ymzz.ccxt_adapter import load_ccxt_bars
+
+        if instrument != "spot":
+            raise ConfigError("ccxt 可選適配器這版只接現貨 K 線。永續仍走 okx 或 binance，以免漏掉資金費。")
+        bars, extra = load_ccxt_bars(ccxt_exchange, symbol, timeframe, now)
+        return bars, [], extra, {"source": "ccxt", "exchange": ccxt_exchange}
+    raise ConfigError(f"沒有這個加密來源：{source}")
+
+
+def _load_gecko(pool: str, timeframe: str, start, end, client: DataClient, now, mode):
+    kind = {"1d": "day", "15m": "minute"}[timeframe]
+    url = f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool}/ohlcv/{kind}"
+    params = {"limit": "1000"}
+    if timeframe == "15m":
+        params["aggregate"] = "15"
+    payload, prov = client.get_json(url, params, mode=mode, headers={"Accept": "application/json"})
+    bars, extra = parse_gecko_ohlcv(payload, timeframe, now)
+    return bars, extra, prov
+
+
+def _load_polymarket(symbol: str, start, end, client: DataClient, now, mode, adapter=None):
+    if adapter == "sdk":
+        from ymzz.polymarket_sdk import SdkUnavailable, load_public_history
+
+        try:
+            history, meta = load_public_history(symbol)
+        except SdkUnavailable:
+            bars, extra, prov = _load_polymarket_httpx(symbol, client, now, mode)
+            extra["adapter"] = "httpx-fallback"
+            extra["beta"] = True
+            extra["note_zh"] = extra.get("note_zh", "") + " 官方 SDK（polymarket-client，MIT，beta）沒有安裝，已改走既有 httpx。沒有用私鑰。"
+            return bars, extra, prov
+        bars, extra = parse_polymarket_history(history, now)
+        extra.update(meta)
+        extra["beta"] = True
+        extra["note_zh"] = extra.get("note_zh", "") + " 這次走官方 polymarket-client（MIT，beta）。只讀公開市場與歷史價，沒有用私鑰。"
+        return bars, extra, {"source": "polymarket-sdk", "beta": True, "sha256": None}
+    return _load_polymarket_httpx(symbol, client, now, mode)
+
+
+def _load_polymarket_httpx(symbol: str, client: DataClient, now, mode):
+    gamma_url = "https://gamma-api.polymarket.com/markets"
+    if symbol.isdigit():
+        payload, gamma_prov = client.get_json(f"https://gamma-api.polymarket.com/markets/{symbol}", mode=mode)
+        market = payload[0] if isinstance(payload, list) else payload
+    else:
+        payload, gamma_prov = client.get_json(gamma_url, {"slug": symbol, "limit": "1"}, mode=mode)
+        if not payload:
+            raise DataSourceError(f"Gamma 找不到市場 {symbol}")
+        market = payload[0]
+    token_ids = market.get("clobTokenIds")
+    if isinstance(token_ids, str):
+        token_ids = json.loads(token_ids)
+    if not token_ids:
+        raise DataSourceError("Gamma 市場沒有 clobTokenIds，無法要歷史價，也不用現價充當歷史。")
+    outcomes = market.get("outcomes")
+    if isinstance(outcomes, str):
+        outcomes = json.loads(outcomes)
+    token = token_ids[0]
+    outcome = outcomes[0] if outcomes else "index0"
+    # CLOB 不接受過長的 startTs/endTs（會回 400 invalid filters）。
+    # 先拿 interval=max，再在本地依日期過濾；不要把這次失敗換成另一個市場。
+    params = {"market": token, "interval": "max", "fidelity": "1440"}
+    try:
+        history, hist_prov = client.get_json("https://clob.polymarket.com/prices-history", params, mode=mode)
+    except DataSourceError as exc:
+        if exc.extra.get("status_code") == 451:
+            raise DataSourceError(
+                "Polymarket prices-history 回 HTTP 451（這個網路被擋）。歷史回測停止，沒有用 Gamma 現價編一條曲線。",
+                status_code=451,
+                source_url="https://clob.polymarket.com/prices-history",
+            ) from exc
+        raise
+    bars, extra = parse_polymarket_history(history, now)
+    extra["question"] = market.get("question")
+    extra["outcome"] = outcome
+    extra["token_id"] = token
+    extra["gamma_sha256"] = gamma_prov["sha256"]
+    extra["note_zh"] = extra["note_zh"] + f" 標的是結果「{outcome}」的 token，不是 No。"
+    return bars, extra, hist_prov

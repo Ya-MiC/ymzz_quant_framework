@@ -1,0 +1,14 @@
+[Unit]
+Description=YMZZ paper runner
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ymzz
+EnvironmentFile=-/opt/ymzz/.env
+ExecStart=/opt/ymzz/.venv/bin/python -m ymzz.cli run --mode paper
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>晏銘湛箴 · 多端儀表臺</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body class="dash">
+  <header class="top">
+    <div>
+      <p class="brand">晏銘湛箴</p>
+      <h1>多端儀表臺 <span class="en">Dashboard</span></h1>
+    </div>
+    <p class="stamp">本機 127.0.0.1 · 只讀為主 · <span id="refresh" class="refresh">15 秒自動更新</span></p>
+  </header>
+  <main>
+    <section class="venues" id="venues">
+      <article class="venue"><p>Kraken 實盤 <span class="en">Live</span></p><strong id="v-live">—</strong></article>
+      <article class="venue"><p>Kraken 模擬 <span class="en">Paper</span></p><strong id="v-paper">—</strong></article>
+      <article class="venue"><p>Solana 觀察 <span class="en">Watch</span></p><strong id="v-sol">—</strong></article>
+    </section>
+
+    <section class="grid-2">
+      <article class="panel" id="live">
+        <h2>實盤 <span class="en">Live</span></h2>
+        <p id="live-status" class="status">讀取中</p>
+        <div id="live-body"></div>
+        <canvas id="live-equity" width="640" height="160"></canvas>
+      </article>
+      <article class="panel" id="paper">
+        <h2>模擬 <span class="en">Paper</span></h2>
+        <p id="paper-status" class="status">讀取中</p>
+        <div id="paper-body"></div>
+        <canvas id="paper-equity" width="640" height="160"></canvas>
+        <div class="table-wrap"><table id="paper-log"><thead><tr><th>時間</th><th>動作</th><th>RSI</th><th>DIF</th><th>DEA</th><th>原因</th></tr></thead><tbody></tbody></table></div>
+      </article>
+    </section>
+
+    <section class="panel" id="forecast">
+      <h2>預測 <span class="en">Forecast / Signal</span></h2>
+      <p id="forecast-status" class="status">讀取中</p>
+      <div id="forecast-body" class="kv"></div>
+      <form id="bt-form" class="row">
+        <label>開始 <span class="en">start</span><input name="start" value="2026-01-01" /></label>
+        <label>結束 <span class="en">end</span><input name="end" placeholder="空白＝到最新" /></label>
+        <label>本金 <span class="en">capital</span><input name="capital" type="number" value="10" step="0.1" /></label>
+        <label>倉位 <span class="en">size</span><input name="size" type="number" value="1" step="0.05" /></label>
+        <label>止損 <span class="en">SL</span><input name="sl" type="number" value="0.05" step="0.01" /></label>
+        <label>止盈 <span class="en">TP</span><input name="tp" type="number" value="0.10" step="0.01" /></label>
+        <label>手續費 bp <span class="en">fee</span><input name="fee_bp" type="number" value="40" /></label>
+        <label>滑點 bp <span class="en">slip</span><input name="slip_bp" type="number" value="5" /></label>
+        <label>日虧熔斷 <span class="en">daily loss</span><input name="daily_loss" type="number" value="0.15" step="0.01" /></label>
+        <label>RSI<input name="rsi" type="number" value="14" /></label>
+        <label>RSI 低<input name="rsi_low" type="number" value="40" /></label>
+        <label>RSI 高<input name="rsi_high" type="number" value="70" /></label>
+        <label>RSI 出場<input name="rsi_exit" type="number" value="75" /></label>
+        <label>MACD<input name="macd" value="12,26,9" /></label>
+      </form>
+      <div class="actions"><button id="bt-run" type="button">用上面的參數重跑回測</button></div>
+      <p id="bt-out" class="note"></p>
+    </section>
+
+    <section class="panel" id="sweep">
+      <h2>策略掃描 <span class="en">Kraken spot</span></h2>
+      <p id="sweep-status" class="status">讀取中</p>
+      <div class="table-wrap">
+        <table id="sweep-table">
+          <thead><tr><th>交易對</th><th>週期</th><th>策略</th><th>不追高</th><th>報酬</th><th>回撤</th><th>來回</th><th>期末</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <canvas id="sweep-equity" width="1100" height="180"></canvas>
+      <canvas id="sweep-dd" width="1100" height="120"></canvas>
+      <div class="table-wrap">
+        <table id="sweep-trades">
+          <thead><tr><th>時間</th><th>動作</th><th>價格</th><th>原因</th><th>手續費</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" id="slots">
+      <h2>一個月高頻 <span class="en">30-day OOS</span></h2>
+      <p id="slot-status" class="status">讀取中</p>
+      <div class="table-wrap">
+        <table id="variant-table">
+          <thead><tr><th>列</th><th>費用</th><th>報酬</th><th>回撤</th><th>來回</th><th>勝率</th><th>手續費</th><th>期末</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <canvas id="slot-equity" width="1100" height="180"></canvas>
+      <div class="table-wrap">
+        <table id="slot-table">
+          <thead><tr><th>行情</th><th>週期</th><th>根數</th><th>起</th><th>迄</th><th>天數</th><th>說明</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <article class="panel" id="solana">
+        <h2>Phantom / Solana <span class="en">read-only</span></h2>
+        <p class="note">貼公開地址。不連接錢包、不簽名、不讀私鑰。餘額來自免費公共 RPC。觀察名單可以繼續加地址，這版不判斷是不是聰明錢。</p>
+        <form id="watch-form" class="actions">
+          <input id="watch-address" placeholder="Solana 公開地址" />
+          <button type="submit">加入觀察</button>
+        </form>
+        <div id="sol-body"></div>
+      </article>
+      <article class="panel" id="status">
+        <h2>狀態 <span class="en">Status</span></h2>
+        <div id="status-body" class="kv"></div>
+      </article>
+    </section>
+  </main>
+  <footer>晏銘湛箴 YMZZ · 多端儀表臺 · 研究用，不是投資建議。實盤仍受 10 美元、現貨 1 倍與止損硬上限約束。</footer>
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
