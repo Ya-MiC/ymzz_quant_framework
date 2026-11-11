@@ -1,5 +1,6 @@
 """儀表臺、純 Python 紙上成交、runner 鎖。不打真實私有 API，不印密鑰。"""
 
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -264,6 +265,41 @@ def test_dashboard_endpoints_do_not_leak_or_trade(tmp_path, monkeypatch):
     assert "多端儀表臺" in page.text
     ran = client.post("/api/dashboard/backtest", json={"capital": 10, "start": "2026-01-01"})
     assert ran.json()["metrics"]["round_trips"] == 0
+
+
+def test_sweep_view_serves_summary_then_one_curve(tmp_path):
+    payload = {
+        "recommendation": {"id": "BTC/USD|1d|macd", "reason_zh": "回撤較小"},
+        "coverage": [],
+        "rows": [
+            {
+                "id": "BTC/USD|1d|macd",
+                "symbol": "BTC/USD",
+                "timeframe": "1d",
+                "strategy": "macd",
+                "chase": False,
+                "total_return": 0.02,
+                "max_drawdown": 0.04,
+                "return_over_dd": 0.5,
+                "round_trips": 6,
+                "final_equity": 10.2,
+                "equity": [{"time": "2026-01-01", "equity": 10, "drawdown": 0}],
+                "trades": [{"time": "2026-01-02", "action": "buy", "price": 100, "reason": "signal", "fee": 0.01}],
+            }
+        ],
+    }
+    (tmp_path / "results").mkdir()
+    (tmp_path / "results" / "crypto_sweep.json").write_text(json.dumps(payload), encoding="utf-8")
+    client = TestClient(create_dashboard_app(tmp_path))
+    summary = client.get("/api/dashboard/sweep").json()
+    assert summary["ok"] is True
+    assert "equity" not in summary["rows"][0]
+    detail = client.get("/api/dashboard/sweep", params={"id": "BTC/USD|1d|macd"}).json()
+    assert detail["row"]["trades"][0]["action"] == "buy"
+    page = client.get("/").text
+    assert "策略掃描" in page
+    empty = TestClient(create_dashboard_app(tmp_path / "missing"))
+    assert empty.get("/api/dashboard/sweep").json()["rows"] == []
 
 
 def test_public_address_and_balance_parser():

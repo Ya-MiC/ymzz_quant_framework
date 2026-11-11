@@ -311,8 +311,23 @@ def parse_kraken_asset_pairs(payload) -> dict:
     return limits
 
 
-def load_kraken_limits(client: DataClient, mode: str = "live") -> tuple[dict, dict]:
-    payload, prov = client.get_json("https://api.kraken.com/0/public/AssetPairs", {"pair": "XBTUSD"}, mode=mode)
+KRAKEN_SPOT_PAIRS = {
+    ("BTC", "USD"): "XBTUSD",
+    ("ETH", "USD"): "ETHUSD",
+    ("SOL", "USD"): "SOLUSD",
+}
+
+
+def kraken_rest_pair(symbol: str) -> str:
+    base, quote = _split_symbol(symbol)
+    try:
+        return KRAKEN_SPOT_PAIRS[(base, quote)]
+    except KeyError as exc:
+        raise ConfigError("Kraken 現貨回測只接 BTC/USD、ETH/USD、SOL/USD。沒有對過的代碼不會猜。") from exc
+
+
+def load_kraken_limits(client: DataClient, mode: str = "live", pair: str = "XBTUSD") -> tuple[dict, dict]:
+    payload, prov = client.get_json("https://api.kraken.com/0/public/AssetPairs", {"pair": pair}, mode=mode)
     limits = parse_kraken_asset_pairs(payload)
     limits["source_url"] = prov.get("source_url")
     limits["fetched_at_utc"] = prov.get("fetched_at_utc")
@@ -549,11 +564,16 @@ def _load_crypto(source, symbol, timeframe, instrument, start, end, client: Data
     if source == "kraken":
         if instrument != "spot":
             raise ConfigError("Kraken 這版只有現貨 OHLC，不會把現貨當成永續。")
-        if (base, quote) != ("BTC", "USD"):
-            raise ConfigError("Kraken 這版只接 BTC/USD。其他交易對沒有對過代號，所以不猜。")
+        pair = kraken_rest_pair(symbol)
         url = "https://api.kraken.com/0/public/OHLC"
-        payload, prov = client.get_json(url, {"pair": "XBTUSD", "interval": str(KRAKEN_MINUTES[timeframe])}, mode=mode)
+        params = {"pair": pair, "interval": str(KRAKEN_MINUTES[timeframe])}
+        if start is not None:
+            params["since"] = str(int(start.timestamp()))
+        payload, prov = client.get_json(url, params, mode=mode)
         bars, extra = parse_kraken_ohlc(payload, timeframe, now)
+        if start is not None and bars and bars[0].open_time.date() > start.date():
+            extra["history_short"] = True
+            extra["note_zh"] = extra.get("note_zh", "") + " 公開 OHLC 大約只留 720 根。更早的日子這支 API 沒有，沒有用別的來源補。"
         return bars, [], extra, prov
     if source == "okx":
         inst = f"{base}-{quote}" + ("-SWAP" if instrument == "perpetual" else "")

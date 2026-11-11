@@ -9,7 +9,7 @@ CATALOG = [
         "instrument": "spot",
         "sources": ["okx", "binance", "kraken", "ccxt"],
         "default_source": "okx",
-        "symbols": ["BTC/USDT", "BTC/USD", "ETH/USDT"],
+        "symbols": ["BTC/USDT", "BTC/USD", "ETH/USD", "SOL/USD", "ETH/USDT"],
         "timeframes": ["1d", "4h", "1h", "15m"],
         "leverage": [1],
         "currency": "USDT",

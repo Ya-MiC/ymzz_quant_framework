@@ -62,6 +62,25 @@
       <p id="bt-out" class="note"></p>
     </section>
 
+    <section class="panel" id="sweep">
+      <h2>策略掃描 <span class="en">Kraken spot</span></h2>
+      <p id="sweep-status" class="status">讀取中</p>
+      <div class="table-wrap">
+        <table id="sweep-table">
+          <thead><tr><th>交易對</th><th>週期</th><th>策略</th><th>不追高</th><th>報酬</th><th>回撤</th><th>來回</th><th>期末</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <canvas id="sweep-equity" width="1100" height="180"></canvas>
+      <canvas id="sweep-dd" width="1100" height="120"></canvas>
+      <div class="table-wrap">
+        <table id="sweep-trades">
+          <thead><tr><th>時間</th><th>動作</th><th>價格</th><th>原因</th><th>手續費</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="grid-2">
       <article class="panel" id="solana">
         <h2>Phantom / Solana <span class="en">read-only</span></h2>

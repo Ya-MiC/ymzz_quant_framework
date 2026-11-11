@@ -170,7 +170,7 @@ ssh -L 8787:127.0.0.1:8787 user@server
 | 市場 | 來源 | 說明 |
 | --- | --- | --- |
 | A 股日線 | 新浪、騰訊前復權、東財 `fqt=1` | 只有日線。新浪沒有復權參數，不稱作前復權。騰訊與東財的量是手，程式乘 100 成股。東財主機要明示，預設 `80.push2his.eastmoney.com`，不會輪詢。 |
-| BTC 現貨 | OKX、幣安、Kraken `BTC/USD`，另有可選 ccxt | OKX 日線切在 UTC+8。幣安與 Kraken 切在 UTC。Kraken 公開 OHLC 大約 720 根，未收盤與 `last` 之後的 K 線會剔除。不要混著比訊號。ccxt 要另裝，並在請求帶 `ccxt_exchange`，不會改走那三個既有解析。 |
+| BTC 現貨 | OKX、幣安、Kraken `BTC/USD`，另有可選 ccxt | OKX 日線切在 UTC+8。幣安與 Kraken 切在 UTC。Kraken 公開 OHLC 大約 720 根，未收盤與 `last` 之後的 K 線會剔除。回測另接受 `ETH/USD` 與 `SOL/USD`；紙上與實盤下單仍只做 BTC/USD。不要混著比訊號。ccxt 要另裝，並在請求帶 `ccxt_exchange`，不會改走那三個既有解析。 |
 | BTC 永續 | OKX、幣安 | 必須同時拿到資金費，而且幣安會帶 `startTime`／`endTime` 逐頁補齊。Kraken 這版沒有永續。ccxt 不接永續。 |
 | Solana 池 | GeckoTerminal 日線與 15 分 | 熱門池有生存者偏差。預設 30bp 是假設的池費。 |
 | Polymarket | 預設 Gamma + CLOB `prices-history` | 用 token id。歷史是價格點。HTTP 451 或空陣列就停止，不用現價編歷史。`adapter=sdk` 會試官方 `polymarket-client`（MIT，beta）；沒裝就退回 httpx。 |
@@ -197,6 +197,8 @@ freqtrade、backtesting.py、vectorbt、python-telegram-bot 只可當對照，�
 5 筆來回，勝率 40%，期末 **11.0269** 美元（四捨五入就是先前報告的 11.03），報酬 **+10.27%**，最大回撤 **5.36%**，樣本期買入持有 **-16.53%**。五筆的成交價與先前核准明細相同。完整表在 `docs/1111_1032_seoul_rsi_macd_kraken_1d.md`。
 
 5 筆什麼都證明不了。同一份核准紀錄裡，4 小時與 1 小時全部虧錢，不建議拿 10 美元去模擬那些週期。這不是投資建議。回測用下一根開盤加固定滑點，沒有排隊、沒有部分成交。
+
+另一次掃描用 80 bp taker，把 BTC、ETH、SOL 的日線與 4 小時、五個策略，以及「不追高」濾網一起跑。日線蓋近一年，4 小時只有公開 OHLC 留得住的約 120 天。排序與唯一推薦寫在 `docs/` 裡檔名帶首爾時間的加密策略掃描。儀表臺同一頁有這份存檔的權益、回撤與成交，不會每 15 秒重抓整段曲線。
 
 ## 測試
 

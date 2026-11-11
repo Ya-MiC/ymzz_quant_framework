@@ -16,6 +16,8 @@ body.dash main {
 .down-text { color: var(--down); }
 .up-text { color: var(--up); }
 .refresh { font-size: 0.85rem; color: var(--muted); }
+#sweep-table tbody tr { cursor: pointer; }
+#sweep-table tbody tr:hover { background: #f6f0e4; }
 @media (max-width: 860px) {
   .venues, .grid-2 { grid-template-columns: 1fr; }
 }

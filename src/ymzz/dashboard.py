@@ -287,6 +287,28 @@ def create_dashboard_app(root: Path | None = None, *, live_reader=None, balance_
         addresses = add_watch_address(root, body.address)
         return {"ok": True, "addresses": addresses}
 
+    @app.get("/api/dashboard/sweep")
+    def sweep(id: str | None = None):
+        path = root / "results" / "crypto_sweep.json"
+        if not path.exists():
+            return {"ok": True, "rows": [], "message_zh": "還沒有掃描檔。先跑 python -m ymzz.sweep。"}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if id:
+            row = next((item for item in payload["rows"] if item["id"] == id), None)
+            if row is None:
+                return {"ok": False, "message_zh": "沒有這一列。"}
+            return {"ok": True, "row": row}
+        summary = []
+        for item in payload["rows"]:
+            summary.append({key: item[key] for key in item if key not in {"equity", "trades", "warnings", "signal_warnings"}})
+        return {
+            "ok": True,
+            "recommendation": payload.get("recommendation"),
+            "coverage": payload.get("coverage"),
+            "rows": summary,
+            "note_zh": "存檔的 Kraken 現貨掃描。點一列才載入權益與成交。沒有下單。",
+        }
+
     @app.get("/api/dashboard/status")
     def status():
         return status_view(root)

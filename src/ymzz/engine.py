@@ -96,6 +96,8 @@ class EngineConfig:
     signal_mode: str = "target"
     entry_trigger: str = "edge"
     t_plus_one: bool = False
+    chase_rise: float | None = None
+    chase_bars: int = 20
 
     def validated(self) -> "EngineConfig":
         self.leverage = enforce_leverage(self.leverage, self.instrument)
@@ -124,6 +126,10 @@ class EngineConfig:
             raise ConfigError("訊號模式只能是 target 或 pulse")
         if self.entry_trigger not in {"edge", "level"}:
             raise ConfigError("進場觸發只能是 edge（等新的交叉）或 level（舊的持倉目標還在就再進）")
+        if self.chase_rise is not None and self.chase_rise <= 0:
+            raise ConfigError("追高濾網的漲幅必須為正；要關掉請不要設定")
+        if self.chase_bars < 2:
+            raise ConfigError("追高濾網至少回看 2 根")
         return self
 
 
@@ -554,6 +560,12 @@ def run_backtest(
 
     def open_to_exposure(exposure: float, bar: Bar) -> bool:
         nonlocal bought_this_bar, executed
+        if cfg.chase_rise is not None and qty == 0 and exposure > 0 and cursor_i >= cfg.chase_bars:
+            window = bars[cursor_i - cfg.chase_bars : cursor_i]
+            floor = min(item.low for item in window)
+            if floor > 0 and bar.open > floor * (1.0 + cfg.chase_rise):
+                log_skip(bar, "chase_filter", price=bar.open, floor=floor, rise=bar.open / floor - 1.0)
+                return False
         desired = target_qty(bar.open, exposure, bar)
         if abs(exposure) > 1e-9 and abs(desired) < 1e-16 and cfg.lot_size > 0 and cfg.ordermin <= 0 and cfg.costmin <= 0:
             blocked_lots_add()
@@ -583,7 +595,9 @@ def run_backtest(
         if cfg.entry_trigger == "edge" and abs(closed_exposure) > 1e-9:
             reentry_block = closed_exposure
 
+    cursor_i = 0
     for i, bar in enumerate(bars):
+        cursor_i = i
         bought_this_bar = False
         if daily_on:
             day = bar.open_time.astimezone(timezone.utc).date()
@@ -748,6 +762,7 @@ def run_backtest(
         "win_rate": (wins / len(round_trips)) if round_trips else None,
         "skips_below_minimum": sum(1 for row in skips if row["reason"] == "below minimum"),
         "skips_halt": sum(1 for row in skips if row["reason"] == "daily_circuit_breaker"),
+        "skips_chase": sum(1 for row in skips if row["reason"] == "chase_filter"),
     }
     return BacktestResult(trades, equity_rows, metrics, warnings, skips, round_trips)
 

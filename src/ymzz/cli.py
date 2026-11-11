@@ -95,13 +95,14 @@ def run_backtest_cli(args, root: Path | None = None) -> dict:
     get_strategy(args.strategy)
     market = "crypto_spot"
     symbol = args.symbol
-    if args.source == "kraken" and symbol.upper().replace("-", "/") not in {"BTC/USD", "XBT/USD"}:
-        raise ConfigError("Kraken 這版只接 BTC/USD。")
+    kraken_symbol = symbol.upper().replace("-", "/")
+    if args.source == "kraken" and kraken_symbol not in {"BTC/USD", "XBT/USD", "ETH/USD", "SOL/USD"}:
+        raise ConfigError("Kraken 回測只接 BTC/USD、ETH/USD、SOL/USD。紙上與實盤下單仍只做 BTC/USD。")
     client = DataClient(root / "data" / "cache")
     spec = {
         "market": market,
         "source": args.source,
-        "symbol": "BTC/USD" if args.source == "kraken" else symbol,
+        "symbol": ("BTC/USD" if kraken_symbol in {"BTC/USD", "XBT/USD"} else kraken_symbol) if args.source == "kraken" else symbol,
         "timeframe": args.timeframe,
         "start": args.start,
         "end": args.end,
@@ -115,7 +116,9 @@ def run_backtest_cli(args, root: Path | None = None) -> dict:
     indicator_exits = indicators.pop("_indicator_exit", None)
     limits = None
     if args.source == "kraken":
-        limits, limit_prov = load_kraken_limits(client, "live")
+        from ymzz.data import kraken_rest_pair
+
+        limits, limit_prov = load_kraken_limits(client, "live", kraken_rest_pair(spec["symbol"]))
         provenance = {**provenance, "kraken_limits": limits, "kraken_limits_sha256": limit_prov.get("sha256")}
         ordermin = float(limits["ordermin"])
         costmin = float(limits["costmin"])

@@ -151,7 +151,7 @@ USDC 在 Polygon 與 Arbitrum 上各有 USDC.e 和 native USDC。轉出錢包用
 
 <https://support.kraken.com/articles/kraken-markets>（Last updated: October 30, 2026）
 
-本倉庫的程式目前只接受 BTC/USD。`src/ymzz/paper.py` 的 `kraken_pair()` 只放行 `BTCUSD`／`XBTUSD`。`python -m ymzz.cli backtest --source kraken` 也只接受 `BTC/USD` 或 `XBT/USD`。紙上與實盤載入 K 線時使用的就是 BTC/USD。因此：
+紙上與實盤下單仍只接受 BTC/USD。`src/ymzz/paper.py` 的 `kraken_pair()` 只放行 `BTCUSD`／`XBTUSD`。回測指令另外接受 `ETH/USD` 與 `SOL/USD`，那兩對沒有接到紙上或實盤下單。因此：
 
 - 帳戶裡需要 USD，再由程式去交易 XBT/USD。
 - 你若只持有 USDC，**不要**把命令改成 `--symbol BTC/USDC`。公開 API 看得到 `XBT/USDC`，這支 CLI 仍會拒絕。

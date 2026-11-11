@@ -23,6 +23,35 @@ async function getJson(url, options) {
   return body;
 }
 
+function drawSeries(canvas, values, color) {
+  const ctx = canvas.getContext("2d");
+  const width = canvas.width;
+  const height = canvas.height;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#fffdf8";
+  ctx.fillRect(0, 0, width, height);
+  const series = (values || []).map(Number).filter((n) => Number.isFinite(n));
+  if (series.length < 2) {
+    ctx.fillStyle = "#5e564c";
+    ctx.font = "14px serif";
+    ctx.fillText("點上面一列", 16, 28);
+    return;
+  }
+  const min = Math.min(...series);
+  const max = Math.max(...series);
+  const span = max - min || 1;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  series.forEach((value, i) => {
+    const x = 8 + (i / (series.length - 1)) * (width - 16);
+    const y = height - 8 - ((value - min) / span) * (height - 16);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
 function draw(canvas, points) {
   const ctx = canvas.getContext("2d");
   const width = canvas.width;
@@ -217,5 +246,47 @@ $("watch-form").addEventListener("submit", async (event) => {
   }
 });
 
+function pct(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+  return `${(Number(value) * 100).toFixed(1)}%`;
+}
+
+async function loadSweep() {
+  const body = await getJson("/api/dashboard/sweep");
+  const status = $("sweep-status");
+  if (!body.rows || !body.rows.length) {
+    status.textContent = body.message_zh || "沒有掃描檔";
+    return;
+  }
+  const rec = body.recommendation || {};
+  status.textContent = rec.id ? `推薦 ${rec.id}。${rec.reason_zh || ""}` : (rec.reason_zh || body.note_zh || "");
+  const tbody = document.querySelector("#sweep-table tbody");
+  tbody.innerHTML = "";
+  const ranked = body.rows.slice().sort((a, b) => (b.return_over_dd ?? -999) - (a.return_over_dd ?? -999));
+  ranked.forEach((row) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${row.symbol}</td><td>${row.timeframe}</td><td>${row.strategy}</td><td>${row.chase ? "是" : "否"}</td><td>${pct(row.total_return)}</td><td>${pct(row.max_drawdown)}</td><td>${text(row.round_trips)}</td><td>${money(row.final_equity)}</td>`;
+    tr.addEventListener("click", () => showSweep(row.id));
+    tbody.appendChild(tr);
+  });
+}
+
+async function showSweep(id) {
+  const body = await getJson(`/api/dashboard/sweep?id=${encodeURIComponent(id)}`);
+  const row = body.row;
+  drawSeries($("sweep-equity"), (row.equity || []).map((item) => item.equity), "#8a6a2f");
+  drawSeries($("sweep-dd"), (row.equity || []).map((item) => item.drawdown), "#8c3a3a");
+  const tbody = document.querySelector("#sweep-trades tbody");
+  tbody.innerHTML = "";
+  (row.trades || []).forEach((trade) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${trade.time}</td><td>${trade.action}</td><td>${text(trade.price)}</td><td>${trade.reason}</td><td>${text(trade.fee)}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
 refresh();
+loadSweep().catch((error) => {
+  $("sweep-status").textContent = error.message;
+});
 setInterval(refresh, 15000);
