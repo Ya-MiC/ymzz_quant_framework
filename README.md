@@ -4,6 +4,8 @@
 
 這版做三件事：用真實公開行情回測、把槓桿上限鎖在 2 倍、預留以後用自己的 Telegram 機器人發訊號。預設不下單、不收私鑰、不連接付費 API。實盤路徑要另外打開，而且本金、槓桿與止損有硬上限。
 
+**入金與 API（請先看這份）：** [Kraken 入金與 API 設定教程](docs/kraken_入金與API設定教程.md)。晏銘要自己為已開通的 Kraken 帳戶入金約 10 美元，並建立給 `python -m ymzz.cli paper`／`--live` 用的 API 金鑰時，照那份做。金鑰不要貼進對話、Issue、截圖或 Git。
+
 ## 安裝與執行
 
 ```bash
@@ -43,7 +45,7 @@ PYTHONPATH=src python -m ymzz.cli paper \
 
 狀態在 `data/paper/state.json`，決策會附加到旁邊的 CSV 與 Markdown。紙上單呼叫本機的 `kraken paper buy`、`kraken paper sell`、`kraken paper status`（krakenfx/kraken-cli，MIT）。沒有安裝 CLI 時，有訊號的那一步會失敗並留下錯誤，不會假裝成交。
 
-`--live` 預設拒絕。要送實盤必須同時有環境變數 `KRAKEN_API_KEY`、`KRAKEN_API_SECRET` 和 `--i-confirm-live`。硬上限是本金不超過 10 美元、現貨 1 倍、買單一定附止損。程式不會印出密鑰。這份倉庫的測試沒有、也不會打實盤。
+`--live` 預設拒絕。要送實盤必須同時有環境變數 `KRAKEN_API_KEY`、`KRAKEN_API_SECRET` 和 `--i-confirm-live`。硬上限是本金不超過 10 美元、現貨 1 倍、買單一定附止損。程式不會印出密鑰。這份倉庫的測試沒有、也不會打實盤。入金、權限與交鑰步驟見 [Kraken 入金與 API 設定教程](docs/kraken_入金與API設定教程.md)。
 
 紙上訊號機器人：
 
