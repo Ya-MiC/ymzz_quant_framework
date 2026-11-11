@@ -24,7 +24,7 @@ from ymzz.data import load_kraken_limits, load_market
 from ymzz.engine import CostConfig, EngineConfig, run_backtest, sample_buy_hold
 from ymzz.errors import ConfigError, YmzzError
 from ymzz.http_cache import DataClient
-from ymzz.paper import step_decision
+from ymzz.paper import kraken_pair, step_decision
 from ymzz.sim import build_runner
 from ymzz.strategies import compute_signals, get_strategy
 from ymzz.timeutil import now_utc, to_kst
@@ -63,6 +63,8 @@ def strategy_params(strategy: str, args) -> dict:
         return {"period": args.rsi}
     if strategy == "rsi_three":
         return {}
+    if strategy == "hf_trigger":
+        return {"period": args.rsi, "oversold": args.rsi_low, "overbought": args.rsi_high}
     return {}
 
 
@@ -88,21 +90,106 @@ def _pct(value) -> str:
     return f"{value * 100:.2f}%"
 
 
+def _run_hf_backtest(args, root: Path) -> dict:
+    """現貨紙上同一套規則。30 日樣本外的研究數字在 docs 的高頻報告，不在這支指令裡重挑。"""
+    from ymzz.data import kraken_rest_pair
+    from ymzz.hf import preset_config, run_hf
+
+    if args.source != "kraken":
+        raise ConfigError("高頻預設的回測只接 Kraken 現貨。")
+    client = DataClient(root / "data" / "cache")
+    symbol = args.symbol.upper().replace("-", "/")
+    aliases = {"XBT/USD": "BTC/USD", "XBT/USDC": "BTC/USDC"}
+    load_symbol = aliases.get(symbol, symbol)
+    spec = {
+        "market": "crypto_spot",
+        "source": "kraken",
+        "symbol": load_symbol,
+        "timeframe": args.timeframe,
+        "start": None,
+        "end": None,
+        "data_mode": "live",
+        "strict_range": False,
+    }
+    bars, _funding, provenance = load_market(spec, client)
+    closes = [bar.close for bar in bars]
+    params = strategy_params("hf_trigger", args)
+    signals, _indicators, warnings = compute_signals("hf_trigger", closes, params, True)
+    limits, limit_prov = load_kraken_limits(client, "live", kraken_rest_pair(load_symbol))
+    result = run_hf(
+        bars,
+        signals,
+        preset_config(
+            sl=args.sl,
+            tp=args.tp,
+            capital=args.capital,
+            maker_bps=args.fee_bp,
+            taker_bps=max(args.fee_bp, 80.0) if args.fee_bp <= 40 else args.fee_bp,
+            slip_bps=args.slip_bp,
+            daily_loss=args.daily_loss if args.daily_loss and args.daily_loss > 0 else 0.15,
+            lot_decimals=int(limits["lot_decimals"]),
+            ordermin=float(limits["ordermin"]),
+            costmin=float(limits["costmin"]),
+            store_equity=True,
+        ),
+    )
+    moment = now_utc()
+    stamp = _stamp(moment)
+    text = "\n".join(
+        [
+            "# hf_trigger 現貨回測（晏銘湛箴）",
+            "",
+            f"- 寫作時間：{to_kst(moment).strftime('%Y-%m-%d %H:%M')} KST",
+            f"- 來源：kraken 現貨 {load_symbol} {args.timeframe}",
+            f"- 已收盤 K 線：{len(bars)}。公開 OHLC 大約只有最近 720 根，這支指令沒有把缺的日子補上。",
+            f"- 本金 {args.capital}，名義上限 10 美元，槓桿 1。做市 {args.fee_bp} bp，止損按吃單。",
+            f"- 期末 {result['final_equity']:.4f}，報酬 {_pct(result['total_return'])}，最大回撤 {_pct(result['max_drawdown'])}",
+            f"- 來回 {result['round_trips']}，勝率 {_pct(result['win_rate'])}，手續費 {result['fees_paid']:.4f}",
+            "- 這次回測沒有下單。樣本外研究見一個月高頻報告，參數不是在這段輸出裡重挑的。",
+            "",
+        ]
+    )
+    out = root / "results" / f"{stamp}_seoul_hf_trigger_kraken_{args.timeframe}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text, encoding="utf-8")
+    print(text)
+    return {
+        "report": str(out),
+        "metrics": {key: result[key] for key in result if key not in {"equity", "trades"}},
+        "bars": len(bars),
+        "warnings": warnings,
+        "limits_sha256": limit_prov.get("sha256"),
+        "provenance": provenance.get("sha256"),
+    }
+
+
 def run_backtest_cli(args, root: Path | None = None) -> dict:
     root = root or project_root()
+    if getattr(args, "strategy", None) == "hf_trigger":
+        return _run_hf_backtest(args, root)
     if args.source not in {"kraken", "okx"}:
         raise ConfigError("這個指令的來源只接受 kraken 或 okx。失敗時不會改接別的交易所。")
     get_strategy(args.strategy)
     market = "crypto_spot"
     symbol = args.symbol
     kraken_symbol = symbol.upper().replace("-", "/")
-    if args.source == "kraken" and kraken_symbol not in {"BTC/USD", "XBT/USD", "ETH/USD", "SOL/USD"}:
-        raise ConfigError("Kraken 回測只接 BTC/USD、ETH/USD、SOL/USD。紙上與實盤下單仍只做 BTC/USD。")
+    kraken_aliases = {
+        "BTC/USD": "BTC/USD",
+        "XBT/USD": "BTC/USD",
+        "ETH/USD": "ETH/USD",
+        "SOL/USD": "SOL/USD",
+        "BTC/USDC": "BTC/USDC",
+        "XBT/USDC": "BTC/USDC",
+        "ETH/USDC": "ETH/USDC",
+        "SOL/USDC": "SOL/USDC",
+    }
+    if args.source == "kraken" and kraken_symbol not in kraken_aliases:
+        raise ConfigError("Kraken 現貨只接 BTC、ETH、SOL 的 USD 或 USDC。沒有對過的代碼不會猜。")
     client = DataClient(root / "data" / "cache")
     spec = {
         "market": market,
         "source": args.source,
-        "symbol": ("BTC/USD" if kraken_symbol in {"BTC/USD", "XBT/USD"} else kraken_symbol) if args.source == "kraken" else symbol,
+        "symbol": (kraken_aliases[kraken_symbol] if args.source == "kraken" else symbol),
         "timeframe": args.timeframe,
         "start": args.start,
         "end": args.end,
@@ -258,10 +345,19 @@ def run_paper_cli(args, root: Path | None = None, runner=None) -> dict:
     if args.source != "kraken":
         raise ConfigError("紙上與實盤路徑只接 Kraken 現貨。")
     client = DataClient(root / "data" / "cache")
+    from ymzz.data import kraken_rest_pair
+
+    symbol = args.symbol.upper().replace("-", "/")
+    aliases = {
+        "XBT/USD": "BTC/USD",
+        "XBT/USDC": "BTC/USDC",
+    }
+    load_symbol = aliases.get(symbol, symbol)
+    kraken_pair(load_symbol)
     spec = {
         "market": "crypto_spot",
         "source": "kraken",
-        "symbol": "BTC/USD",
+        "symbol": load_symbol,
         "timeframe": args.timeframe,
         "start": None,
         "end": None,
@@ -272,11 +368,37 @@ def run_paper_cli(args, root: Path | None = None, runner=None) -> dict:
     closes = [bar.close for bar in bars]
     params = strategy_params(args.strategy, args)
     signals, indicators, _warnings = compute_signals(args.strategy, closes, params, False)
-    indicator_exits = indicators.pop("_indicator_exit", None) or [0.0] * len(bars)
-    limits, _ = load_kraken_limits(client, "live")
+    limits, _ = load_kraken_limits(client, "live", kraken_rest_pair(load_symbol))
     state_path = Path(args.state) if args.state else root / "data" / "paper" / "state.json"
     if not state_path.is_absolute():
         state_path = root / state_path
+    if args.strategy == "hf_trigger":
+        from ymzz.hf import preset_config, step_hf
+
+        if args.live:
+            from ymzz.paper import LiveRefused
+
+            raise LiveRefused("hf 預設只做紙上。限價、空單和 2 倍都沒有送到 Kraken。這次沒有送出。")
+        decision = step_hf(
+            bars=bars,
+            signals=signals,
+            state_path=state_path,
+            cfg=preset_config(
+                sl=args.sl,
+                tp=args.tp,
+                capital=args.capital,
+                lot_decimals=int(limits["lot_decimals"]),
+                ordermin=float(limits["ordermin"]),
+                costmin=float(limits["costmin"]),
+            ),
+            live=False,
+        )
+        print(
+            f"{decision.get('action')}  {decision.get('reason')}  "
+            f"idempotent={decision.get('idempotent')}  bar={decision.get('bar_open')}"
+        )
+        return decision
+    indicator_exits = indicators.pop("_indicator_exit", None) or [0.0] * len(bars)
     log_stem = state_path.with_suffix("")
     decision = step_decision(
         bars=bars,
@@ -294,7 +416,7 @@ def run_paper_cli(args, root: Path | None = None, runner=None) -> dict:
         ordermin=float(limits["ordermin"]),
         costmin=float(limits["costmin"]),
         lot_decimals=int(limits["lot_decimals"]),
-        symbol=args.symbol,
+        symbol=load_symbol,
         live=args.live,
         confirm=args.i_confirm_live,
         leverage=1.0,
@@ -302,7 +424,9 @@ def run_paper_cli(args, root: Path | None = None, runner=None) -> dict:
             fee_bp=args.fee_bp,
             slip_bp=args.slip_bp,
             ledger_path=Path(str(log_stem) + "_sim.jsonl"),
+            pair=kraken_rest_pair(load_symbol),
         ),
+        max_order_usd=10.0,
     )
     print(
         f"{decision.get('action')}  {decision.get('reason')}  "
@@ -353,10 +477,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_common(target):
-        target.add_argument("--strategy", required=True)
-        target.add_argument("--source", required=True, choices=["kraken", "okx"])
-        target.add_argument("--symbol", required=True)
-        target.add_argument("--timeframe", default="1d", choices=["1d", "4h", "1h"])
+        target.add_argument("--preset", choices=["hf"], default=None)
+        target.add_argument("--strategy", default=None)
+        target.add_argument("--source", default=None, choices=["kraken", "okx"])
+        target.add_argument("--symbol", default=None)
+        target.add_argument("--timeframe", default="1d", choices=["1d", "4h", "1h", "15m", "5m", "1m"])
         target.add_argument("--rsi", type=float, default=14)
         target.add_argument("--rsi-low", type=float, default=40, dest="rsi_low")
         target.add_argument("--rsi-high", type=float, default=70, dest="rsi_high")
@@ -382,6 +507,7 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument("--i-confirm-live", action="store_true", dest="i_confirm_live")
 
     run = sub.add_parser("run", help="常駐：心跳，並在新的已收盤 K 線上做一次決策")
+    run.add_argument("--preset", choices=["hf"], default=None)
     run.add_argument("--mode", choices=["paper", "live"], default="paper")
     run.add_argument("--i-confirm-live", action="store_true", dest="i_confirm_live")
     run.add_argument("--interval", type=float, default=180)
@@ -389,7 +515,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--state", default=None)
     run.add_argument("--strategy", default="rsi_macd")
     run.add_argument("--symbol", default="BTC/USD")
-    run.add_argument("--timeframe", default="1d", choices=["1d", "4h", "1h"])
+    run.add_argument("--timeframe", default="1d", choices=["1d", "4h", "1h", "15m", "5m", "1m"])
     run.add_argument("--rsi", type=float, default=14)
     run.add_argument("--rsi-low", type=float, default=40, dest="rsi_low")
     run.add_argument("--rsi-high", type=float, default=70, dest="rsi_high")
@@ -409,10 +535,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _prepare(args) -> None:
+    if getattr(args, "preset", None) == "hf":
+        from ymzz.hf import apply_hf_preset
+        from ymzz.paper import LiveRefused
+
+        apply_hf_preset(args)
+        if getattr(args, "live", False) or getattr(args, "mode", None) == "live":
+            raise LiveRefused("hf 預設只做紙上。限價、空單和 2 倍都沒有送到 Kraken。這次沒有送出。")
+    if args.command == "dashboard":
+        return
+    if args.command in {"backtest", "paper", "run"} and not getattr(args, "strategy", None):
+        raise ConfigError("要指定 --strategy，或 --preset hf。")
+    if args.command in {"backtest", "paper"} and (not args.source or not args.symbol):
+        raise ConfigError("要指定 --source 和 --symbol，或用 --preset hf。")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        _prepare(args)
         if args.command == "backtest":
             run_backtest_cli(args)
         elif args.command == "paper":

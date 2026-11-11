@@ -92,7 +92,7 @@ def python_paper_command(argv: list[str], *, ticker: float, fee_bp: float, slip_
     return _result(0, fill)
 
 
-def build_runner(*, fee_bp: float, slip_bp: float, ledger_path: Path, ticker_fn=None, which=None):
+def build_runner(*, fee_bp: float, slip_bp: float, ledger_path: Path, ticker_fn=None, which=None, pair: str = "XBTUSD"):
     """有 kraken 執行檔就交給它。沒有時，紙上單改走純 Python；實盤單直接失敗。"""
     finder = which or shutil.which
 
@@ -107,7 +107,7 @@ def build_runner(*, fee_bp: float, slip_bp: float, ledger_path: Path, ticker_fn=
         if paper:
             if argv[2:3] == ["status"]:
                 return python_paper_command(argv, ticker=1.0, fee_bp=fee_bp, slip_bp=slip_bp, ledger_path=ledger_path)
-            price = ticker_fn() if ticker_fn else public_ticker()
+            price = ticker_fn() if ticker_fn else public_ticker(pair)
             return python_paper_command(argv, ticker=price, fee_bp=fee_bp, slip_bp=slip_bp, ledger_path=ledger_path)
         if live_order:
             return _result(127, err="找不到 kraken 執行檔。實盤單不會改用純 Python 成交。")

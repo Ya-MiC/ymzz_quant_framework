@@ -13,12 +13,14 @@ from ymzz.timeutil import CST, UTC, ensure_utc
 
 OKX_BAR = {"1d": "1D", "4h": "4H", "1h": "1H", "15m": "15m"}
 BINANCE_INTERVAL = {"1d": "1d", "4h": "4h", "1h": "1h", "15m": "15m"}
-KRAKEN_MINUTES = {"1d": 1440, "4h": 240, "1h": 60, "15m": 15}
+KRAKEN_MINUTES = {"1d": 1440, "4h": 240, "1h": 60, "15m": 15, "5m": 5, "1m": 1}
 DURATION = {
     "1d": timedelta(days=1),
     "4h": timedelta(hours=4),
     "1h": timedelta(hours=1),
     "15m": timedelta(minutes=15),
+    "5m": timedelta(minutes=5),
+    "1m": timedelta(minutes=1),
 }
 
 
@@ -315,6 +317,9 @@ KRAKEN_SPOT_PAIRS = {
     ("BTC", "USD"): "XBTUSD",
     ("ETH", "USD"): "ETHUSD",
     ("SOL", "USD"): "SOLUSD",
+    ("BTC", "USDC"): "XBTUSDC",
+    ("ETH", "USDC"): "ETHUSDC",
+    ("SOL", "USDC"): "SOLUSDC",
 }
 
 
@@ -323,7 +328,83 @@ def kraken_rest_pair(symbol: str) -> str:
     try:
         return KRAKEN_SPOT_PAIRS[(base, quote)]
     except KeyError as exc:
-        raise ConfigError("Kraken 現貨回測只接 BTC/USD、ETH/USD、SOL/USD。沒有對過的代碼不會猜。") from exc
+        raise ConfigError("Kraken 現貨只接 BTC、ETH、SOL 的 USD 或 USDC。沒有對過的代碼不會猜。") from exc
+
+
+FUTURES_MARKET = {
+    "BTC/USD": "PF_XBTUSD",
+    "ETH/USD": "PF_ETHUSD",
+    "SOL/USD": "PF_SOLUSD",
+}
+FUTURES_DECIMALS = {"PF_XBTUSD": 4, "PF_ETHUSD": 3, "PF_SOLUSD": 2}
+
+
+def parse_kraken_futures_candles(payload, timeframe: str, now: datetime) -> tuple[list[Bar], dict]:
+    candles = payload.get("candles") if isinstance(payload, dict) else None
+    if not candles:
+        raise DataSourceError("Kraken 期貨沒有 K 線")
+    duration = DURATION[timeframe]
+    bars = []
+    dropped = 0
+    for row in candles:
+        opened = _dt_ms(int(row["time"]))
+        if ensure_utc(now) < opened + duration:
+            dropped += 1
+            continue
+        bars.append(
+            Bar(
+                opened,
+                opened + duration,
+                float(row["open"]),
+                float(row["high"]),
+                float(row["low"]),
+                float(row["close"]),
+                float(row.get("volume") or 0.0),
+                None,
+                True,
+            )
+        )
+    return bars, {
+        "timezone": "UTC",
+        "dropped_unclosed": dropped,
+        "note_zh": "這是 Kraken 線性永續的成交 K 線，不是現貨 OHLC。未收盤的最後一根已剔除。",
+    }
+
+
+def parse_kraken_funding_rates(payload) -> list[Funding]:
+    if not isinstance(payload, dict) or payload.get("result") not in (None, "success"):
+        raise DataSourceError("Kraken 資金費回應不是 success")
+    rates = payload.get("rates")
+    if not isinstance(rates, list) or not rates:
+        raise DataSourceError("Kraken 資金費是空的。沒有用 0 填。")
+    events = []
+    for row in rates:
+        stamp = str(row["timestamp"]).replace("Z", "+00:00")
+        events.append(Funding(datetime.fromisoformat(stamp), float(row["relativeFundingRate"])))
+    events.sort(key=lambda item: item.time)
+    return events
+
+
+def load_kraken_futures(client: DataClient, symbol: str, timeframe: str, now: datetime) -> tuple[list[Bar], list[Funding], dict]:
+    try:
+        market = FUTURES_MARKET[symbol]
+    except KeyError as exc:
+        raise ConfigError("期貨回測只接 BTC/USD、ETH/USD、SOL/USD 的線性永續。沒有對過的代碼不會猜。") from exc
+    candle_url = f"https://futures.kraken.com/api/charts/v1/trade/{market}/{timeframe}"
+    candles, candle_prov = client.get_json(candle_url, None, mode="live")
+    bars, extra = parse_kraken_futures_candles(candles, timeframe, now)
+    fund_url = "https://futures.kraken.com/derivatives/api/v4/historicalfundingrates"
+    funding_payload, fund_prov = client.get_json(fund_url, {"symbol": market}, mode="live")
+    funding = parse_kraken_funding_rates(funding_payload)
+    extra["futures_symbol"] = market
+    extra["lot_decimals"] = FUTURES_DECIMALS[market]
+    extra["funding_first"] = funding[0].time.isoformat()
+    extra["funding_last"] = funding[-1].time.isoformat()
+    extra["funding_points"] = len(funding)
+    extra["candle_sha256"] = candle_prov.get("sha256")
+    extra["funding_sha256"] = fund_prov.get("sha256")
+    extra["note_zh"] += " 資金費用 relativeFundingRate，每小時一筆。這段序列開始之前沒有用 0 填。"
+    return bars, funding, extra
 
 
 def load_kraken_limits(client: DataClient, mode: str = "live", pair: str = "XBTUSD") -> tuple[dict, dict]:
@@ -576,6 +657,8 @@ def _load_crypto(source, symbol, timeframe, instrument, start, end, client: Data
             extra["note_zh"] = extra.get("note_zh", "") + " 公開 OHLC 大約只留 720 根。更早的日子這支 API 沒有，沒有用別的來源補。"
         return bars, [], extra, prov
     if source == "okx":
+        if timeframe not in OKX_BAR:
+            raise ConfigError(f"OKX 這支沒有接 {timeframe}。沒有改走別的交易所。")
         inst = f"{base}-{quote}" + ("-SWAP" if instrument == "perpetual" else "")
         bar = OKX_BAR[timeframe]
 
@@ -628,6 +711,8 @@ def _load_crypto(source, symbol, timeframe, instrument, start, end, client: Data
                 extra["note_zh"] = extra.get("note_zh", "") + " 資金費歷史比 K 線短，較早的持倉沒有被填 0，只是沒有事件可扣。"
         return bars, funding, extra, fetch_page.prov
     if source == "binance":
+        if timeframe not in BINANCE_INTERVAL:
+            raise ConfigError(f"Binance 這支沒有接 {timeframe}。沒有改走別的交易所。")
         pair = f"{base}{quote}"
         interval = BINANCE_INTERVAL[timeframe]
         host = "https://fapi.binance.com" if instrument == "perpetual" else "https://api.binance.com"

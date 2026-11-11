@@ -98,6 +98,11 @@ class EngineConfig:
     t_plus_one: bool = False
     chase_rise: float | None = None
     chase_bars: int = 20
+    max_margin_usd: float | None = 10.0
+    max_notional_usd: float | None = 20.0
+    max_order_usd: float | None = None
+    block_entries_after: datetime | None = None
+    require_stop: bool = False
 
     def validated(self) -> "EngineConfig":
         self.leverage = enforce_leverage(self.leverage, self.instrument)
@@ -130,7 +135,31 @@ class EngineConfig:
             raise ConfigError("追高濾網的漲幅必須為正；要關掉請不要設定")
         if self.chase_bars < 2:
             raise ConfigError("追高濾網至少回看 2 根")
+        if self.max_order_usd is not None and self.max_order_usd <= 0:
+            raise ConfigError("單筆名義上限必須為正")
+        if self.max_margin_usd is not None and self.max_margin_usd <= 0:
+            raise ConfigError("單筆保證金上限必須為正")
+        if self.max_notional_usd is not None and self.max_notional_usd <= 0:
+            raise ConfigError("單筆名義上限必須為正")
+        if self.require_stop and (self.sl_pct is None or self.sl_pct <= 0):
+            raise ConfigError("這條路徑必須附止損")
         return self
+
+
+def _position_notional_cap(cfg: EngineConfig) -> float | None:
+    """整手市場不套用。現貨 1 倍時保證金上限就是名義上限。2 倍時名義可以到保證金的兩倍，但不超過名義上限。"""
+    if cfg.lot_size > 0:
+        return None
+    caps: list[float] = []
+    if cfg.max_notional_usd is not None:
+        caps.append(cfg.max_notional_usd)
+    if cfg.max_margin_usd is not None:
+        caps.append(cfg.max_margin_usd * cfg.leverage)
+    if cfg.max_order_usd is not None:
+        caps.append(cfg.max_order_usd)
+    if not caps:
+        return None
+    return min(caps)
 
 
 def total_slip_bps(notional: float, quote_volume: float | None, cost: CostConfig) -> float:
@@ -362,7 +391,7 @@ def run_backtest(
     max_dd = 0.0
     fund_idx = 0
     entry_state: dict | None = None
-    pending_pulse = False
+    pending_pulse = 0.0
     reentry_block: float | None = None
     edge_noted = False
     sod_date = None
@@ -475,6 +504,7 @@ def run_backtest(
         return True
 
     def target_qty(raw: float, exposure: float, bar: Bar) -> float:
+        nonlocal order_capped
         if abs(exposure) < 1e-12:
             return 0.0
         mark_equity = equity_at(raw)
@@ -484,6 +514,12 @@ def run_backtest(
         fraction = abs(exposure) * cfg.position_frac
         fee_rate = cfg.cost.fee_bps / 10000.0
         notional = mark_equity * lev * fraction / (1.0 + fee_rate * lev * fraction)
+        cap = _position_notional_cap(cfg)
+        if cap is not None and notional > cap:
+            notional = cap
+            if not order_capped:
+                order_capped = True
+                warnings.append("單筆名義超過上限，已壓回上限。帳戶變大也不會把這一張單放大。")
         slip_bps = total_slip_bps(notional, bar.quote_volume, cfg.cost)
         side = 1 if exposure > 0 else -1
         price = fill_price(raw, side, slip_bps)
@@ -533,6 +569,9 @@ def run_backtest(
     def try_signal_delta(delta: float, raw: float, bar: Bar) -> bool:
         """進場才受日虧熔斷與最小下單量限制。減倉與平倉照常。"""
         increasing = qty == 0 or (delta * qty > 0) or (qty != 0 and abs(qty + delta) > abs(qty) + 1e-12)
+        if increasing and cfg.block_entries_after is not None and bar.open_time >= cfg.block_entries_after:
+            log_skip(bar, "global_drawdown_breaker", price=raw)
+            return False
         if increasing and daily_on and halted:
             log_skip(bar, "daily_circuit_breaker", price=raw, budget=equity_at(raw) * cfg.position_frac)
             return False
@@ -560,12 +599,18 @@ def run_backtest(
 
     def open_to_exposure(exposure: float, bar: Bar) -> bool:
         nonlocal bought_this_bar, executed
-        if cfg.chase_rise is not None and qty == 0 and exposure > 0 and cursor_i >= cfg.chase_bars:
+        if cfg.chase_rise is not None and qty == 0 and abs(exposure) > 0 and cursor_i >= cfg.chase_bars:
             window = bars[cursor_i - cfg.chase_bars : cursor_i]
-            floor = min(item.low for item in window)
-            if floor > 0 and bar.open > floor * (1.0 + cfg.chase_rise):
-                log_skip(bar, "chase_filter", price=bar.open, floor=floor, rise=bar.open / floor - 1.0)
-                return False
+            if exposure > 0:
+                floor = min(item.low for item in window)
+                if floor > 0 and bar.open > floor * (1.0 + cfg.chase_rise):
+                    log_skip(bar, "chase_filter", price=bar.open, floor=floor, rise=bar.open / floor - 1.0)
+                    return False
+            else:
+                ceiling = max(item.high for item in window)
+                if ceiling > 0 and bar.open < ceiling * (1.0 - cfg.chase_rise):
+                    log_skip(bar, "chase_filter", price=bar.open, ceiling=ceiling, drop=1.0 - bar.open / ceiling)
+                    return False
         desired = target_qty(bar.open, exposure, bar)
         if abs(exposure) > 1e-9 and abs(desired) < 1e-16 and cfg.lot_size > 0 and cfg.ordermin <= 0 and cfg.costmin <= 0:
             blocked_lots_add()
@@ -596,6 +641,7 @@ def run_backtest(
             reentry_block = closed_exposure
 
     cursor_i = 0
+    order_capped = False
     for i, bar in enumerate(bars):
         cursor_i = i
         bought_this_bar = False
@@ -607,14 +653,14 @@ def run_backtest(
                 halted = False
         if bar.suspended:
             pending = None
-            pending_pulse = False
+            pending_pulse = 0.0
             log_skip(bar, "suspended", price=bar.open)
         else:
             if pulse:
-                if pending_pulse and qty == 0:
-                    open_to_exposure(1.0, bar)
+                if pending_pulse != 0 and qty == 0:
+                    open_to_exposure(pending_pulse, bar)
                     reentry_block = None
-                pending_pulse = False
+                pending_pulse = 0.0
             elif pending is not None:
                 desired_exp = float(pending)
                 pending = None
@@ -716,8 +762,8 @@ def run_backtest(
             halted = True
             equity_rows[-1]["halted"] = True
         if pulse:
-            if qty == 0 and i < len(bars) - 1 and float(signals[i]) > 0:
-                pending_pulse = True
+            if qty == 0 and i < len(bars) - 1 and abs(float(signals[i])) > 1e-12:
+                pending_pulse = 1.0 if float(signals[i]) > 0 else -1.0
         elif i < len(bars) - 1:
             pending = float(signals[i])
 
@@ -763,6 +809,10 @@ def run_backtest(
         "skips_below_minimum": sum(1 for row in skips if row["reason"] == "below minimum"),
         "skips_halt": sum(1 for row in skips if row["reason"] == "daily_circuit_breaker"),
         "skips_chase": sum(1 for row in skips if row["reason"] == "chase_filter"),
+        "skips_global": sum(1 for row in skips if row["reason"] == "global_drawdown_breaker"),
+        "max_order_usd": cfg.max_order_usd,
+        "max_margin_usd": cfg.max_margin_usd,
+        "max_notional_usd": cfg.max_notional_usd,
     }
     return BacktestResult(trades, equity_rows, metrics, warnings, skips, round_trips)
 

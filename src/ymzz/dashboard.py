@@ -309,6 +309,35 @@ def create_dashboard_app(root: Path | None = None, *, live_reader=None, balance_
             "note_zh": "存檔的 Kraken 現貨掃描。點一列才載入權益與成交。沒有下單。",
         }
 
+    @app.get("/api/dashboard/slots")
+    def slots(id: str | None = None):
+        path = root / "results" / "hf_month.json"
+        if not path.exists():
+            return {"ok": True, "rows": [], "coverage": [], "message_zh": "還沒有一個月的結果檔。"}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows = payload.get("rows") or []
+        if id == "aggregate":
+            headline = payload.get("headline_id")
+            row = next((item for item in rows if item.get("id") == headline), None)
+            equity = (row or {}).get("equity") or []
+            return {"ok": True, "aggregate": {"equity": equity}}
+        if id:
+            row = next((item for item in rows if item.get("id") == id), None)
+            if row is None:
+                return {"ok": False, "message_zh": "沒有這一列。"}
+            return {"ok": True, "row": row}
+        slim = []
+        for item in rows:
+            slim.append({key: item[key] for key in item if key not in {"equity", "trades"}})
+        return {
+            "ok": True,
+            "recommendation": payload.get("recommendation"),
+            "selected_on_train": payload.get("selected_on_train"),
+            "rows": slim,
+            "coverage": payload.get("coverage") or [],
+            "note_zh": "凍結參數之後的 30 日樣本外。曲線是主列。沒有下單。",
+        }
+
     @app.get("/api/dashboard/status")
     def status():
         return status_view(root)

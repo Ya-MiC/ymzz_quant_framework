@@ -59,6 +59,7 @@ def test_liquidation_price_and_not_naive_multiple():
             tp_pct=None,
             sl_pct=None,
             mmr=0.004,
+            max_order_usd=50,
         ),
     )
     exits = [row for row in result.trades if row["action"] == "sell"]
@@ -84,6 +85,7 @@ def test_gap_through_bankruptcy_floors_at_zero():
             cost=CostConfig(0, 0),
             tp_pct=None,
             sl_pct=None,
+            max_order_usd=50,
         ),
     )
     assert result.metrics["final_equity"] == 0

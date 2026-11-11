@@ -42,25 +42,42 @@ def guard_live(*, live: bool, confirm: bool, capital: float, leverage: float, in
         raise LiveRefused("實盤拒絕：只允許現貨 1 倍。")
 
 
+PAPER_PAIRS = {
+    "BTCUSD": "BTCUSD",
+    "XBTUSD": "BTCUSD",
+    "ETHUSD": "ETHUSD",
+    "SOLUSD": "SOLUSD",
+    "BTCUSDC": "XBTUSDC",
+    "XBTUSDC": "XBTUSDC",
+    "ETHUSDC": "ETHUSDC",
+    "SOLUSDC": "SOLUSDC",
+}
+
+
 def kraken_pair(symbol: str) -> str:
     text = symbol.upper().replace("/", "").replace("-", "")
-    if text in {"BTCUSD", "XBTUSD"}:
-        return "BTCUSD"
-    raise ConfigError("紙上與實盤路徑這版只接受 BTC/USD。不會把其他代碼猜成 Kraken 交易對。")
+    try:
+        return PAPER_PAIRS[text]
+    except KeyError as exc:
+        raise ConfigError("紙上與實盤只接受 BTC、ETH、SOL 的 USD 或 USDC。沒有對過的代碼不會猜。") from exc
 
 
-def order_commands(
-    *,
-    live: bool,
-    side: str,
-    pair: str,
-    qty: float,
-    reason: str,
-    stop_price: float | None,
-) -> list[list[str]]:
-    """回傳要執行的 argv。實盤買單後面一定帶一張止損賣單。"""
-    if side not in {"buy", "sell"}:
-        raise ConfigError("方向只能是 buy 或 sell")
+def _chunk_qty(qty: float, price: float, max_order_usd: float) -> list[float]:
+    max_qty = max_order_usd / price
+    if max_qty <= 0:
+        raise ConfigError("單筆名義上限必須為正")
+    parts: list[float] = []
+    left = qty
+    while left > 1e-12:
+        part = min(left, max_qty)
+        parts.append(part)
+        left -= part
+        if len(parts) > 20:
+            raise LiveRefused("實盤拒絕：這一張要拆成太多筆才壓得進單筆上限。沒有送出。")
+    return parts
+
+
+def _one_command(*, live: bool, side: str, pair: str, qty: float, reason: str, stop_price: float | None) -> list[list[str]]:
     qty_text = f"{qty:.8f}"
     if live:
         if side == "buy":
@@ -86,6 +103,39 @@ def order_commands(
     commands = [["kraken", "paper", side, pair, qty_text, "--type", "market", "--reason", reason]]
     commands.append(["kraken", "paper", "status"])
     return commands
+
+
+def order_commands(
+    *,
+    live: bool,
+    side: str,
+    pair: str,
+    qty: float,
+    reason: str,
+    stop_price: float | None,
+    price: float | None = None,
+    max_order_usd: float = 10.0,
+) -> list[list[str]]:
+    """回傳要執行的 argv。實盤買單後面一定帶一張止損賣單。單筆名義不得超過上限。"""
+    if side not in {"buy", "sell"}:
+        raise ConfigError("方向只能是 buy 或 sell")
+    if max_order_usd <= 0:
+        raise ConfigError("單筆名義上限必須為正")
+    notion = None if price is None or price <= 0 else abs(qty) * price
+    if notion is not None and notion > max_order_usd + 1e-8:
+        if side == "buy":
+            message = f"實盤拒絕：買單名義 {notion:.4f} 超過單筆上限 {max_order_usd:.2f}。沒有送出。"
+            if live:
+                raise LiveRefused(message)
+            raise ConfigError(message.replace("實盤拒絕：", "紙上拒絕："))
+        chunks = _chunk_qty(abs(qty), price, max_order_usd)
+        commands: list[list[str]] = []
+        for chunk in chunks:
+            commands.extend(
+                _one_command(live=live, side=side, pair=pair, qty=chunk, reason=reason, stop_price=stop_price)
+            )
+        return commands
+    return _one_command(live=live, side=side, pair=pair, qty=qty, reason=reason, stop_price=stop_price)
 
 
 def _load_state(path: Path) -> dict:
@@ -152,6 +202,7 @@ def step_decision(
     leverage: float,
     runner,
     now: datetime | None = None,
+    max_order_usd: float = 10.0,
 ) -> dict:
     """對最新一根已收盤 K 線做一次決策。重跑同一根不會再送單。"""
     if not bars:
@@ -247,7 +298,16 @@ def step_decision(
 
     pair = kraken_pair(symbol)
     if exit_reason:
-        commands = order_commands(live=live, side="sell", pair=pair, qty=qty_held, reason=exit_reason, stop_price=None)
+        commands = order_commands(
+            live=live,
+            side="sell",
+            pair=pair,
+            qty=qty_held,
+            reason=exit_reason,
+            stop_price=None,
+            price=bar.close,
+            max_order_usd=max_order_usd,
+        )
         results = _run_all(commands, runner)
         fill = python_fill_from_results(results)
         exit_price = bar.close
@@ -268,9 +328,11 @@ def step_decision(
         return finish("skip", "daily_circuit_breaker", 0.0, bar.close, [])
     if want_entry:
         price = bar.close
-        budget = equity * position_frac
+        budget = min(equity * position_frac, max_order_usd)
         raw_qty = budget / price if price > 0 else 0.0
         qty = floor_qty(raw_qty, lot_decimals)
+        if price > 0 and qty * price > max_order_usd:
+            qty = floor_qty(max_order_usd / price, lot_decimals)
         notional = qty * price
         if qty <= 0 or qty < ordermin or notional < costmin:
             return finish(
@@ -282,7 +344,16 @@ def step_decision(
             )
         stop = price * (1.0 - sl_pct)
         reason = f"收盤進場訊號 RSI={_fmt(rsi)} DIF={_fmt(dif)} DEA={_fmt(dea)}"
-        commands = order_commands(live=live, side="buy", pair=pair, qty=qty, reason=reason, stop_price=stop)
+        commands = order_commands(
+            live=live,
+            side="buy",
+            pair=pair,
+            qty=qty,
+            reason=reason,
+            stop_price=stop,
+            price=price,
+            max_order_usd=max_order_usd,
+        )
         results = _run_all(commands, runner)
         fill = python_fill_from_results(results)
         if fill:

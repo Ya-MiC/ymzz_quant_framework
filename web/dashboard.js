@@ -285,8 +285,38 @@ async function showSweep(id) {
   });
 }
 
+async function loadSlots() {
+  const body = await getJson("/api/dashboard/slots");
+  const status = $("slot-status");
+  if (!body.rows || !body.rows.length) {
+    status.textContent = body.message_zh || "沒有一個月的結果";
+    return;
+  }
+  const rec = body.recommendation || {};
+  status.textContent = rec.reason_zh || body.note_zh || "";
+  const variants = document.querySelector("#variant-table tbody");
+  variants.innerHTML = "";
+  body.rows.forEach((row) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${row.name}</td><td>${row.fee_label || ""}</td><td>${pct(row.total_return)}</td><td>${pct(row.max_drawdown)}</td><td>${text(row.round_trips)}</td><td>${pct(row.win_rate)}</td><td>${money(row.fees_paid)}</td><td>${money(row.final_equity)}</td>`;
+    variants.appendChild(tr);
+  });
+  const slots = document.querySelector("#slot-table tbody");
+  slots.innerHTML = "";
+  (body.coverage || []).forEach((row) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${row.venue}</td><td>${row.timeframe}</td><td>${text(row.n)}</td><td>${row.first || ""}</td><td>${row.last || ""}</td><td>${text(row.days)}</td><td>${row.note_zh || ""}</td>`;
+    slots.appendChild(tr);
+  });
+  const curve = await getJson("/api/dashboard/slots?id=aggregate");
+  drawSeries($("slot-equity"), ((curve.aggregate || {}).equity || []).map((item) => item.equity), "#2f5d50");
+}
+
 refresh();
 loadSweep().catch((error) => {
   $("sweep-status").textContent = error.message;
+});
+loadSlots().catch((error) => {
+  $("slot-status").textContent = error.message;
 });
 setInterval(refresh, 15000);

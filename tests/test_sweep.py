@@ -23,10 +23,16 @@ def test_kraken_spot_pairs_and_since():
     assert kraken_rest_pair("ETH/USD") == "ETHUSD"
     assert kraken_rest_pair("SOL/USD") == "SOLUSD"
     assert kraken_rest_pair("BTC/USD") == "XBTUSD"
+    assert kraken_rest_pair("BTC/USDC") == "XBTUSDC"
+    assert kraken_rest_pair("ETH/USDC") == "ETHUSDC"
+    assert kraken_rest_pair("SOL/USDC") == "SOLUSDC"
+    assert kraken_pair("ETH/USD") == "ETHUSD"
+    assert kraken_pair("BTC/USDC") == "XBTUSDC"
+    assert kraken_pair("SOL/USDC") == "SOLUSDC"
     with pytest.raises(ConfigError):
         kraken_rest_pair("DOGE/USD")
     with pytest.raises(ConfigError):
-        kraken_pair("ETH/USD")
+        kraken_pair("DOGE/USD")
     calls = []
 
     class Client:

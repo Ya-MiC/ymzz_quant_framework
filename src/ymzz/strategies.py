@@ -284,6 +284,24 @@ STRATEGIES: dict[str, StrategySpec] = {
             _p("macd_signal", "MACD 訊號", 9, 2, 100, type_="int"),
         ],
     ),
+    "hf_trigger": StrategySpec(
+        id="hf_trigger",
+        name_zh="高頻 RSI 觸發",
+        summary_zh="收盤 RSI 上穿超賣做多、下穿超買做空。執行時不再挑參數。限價進場，成交當下附止損和止盈。",
+        formula_zh=(
+            "決策只有一條 RSI。上穿超賣線是多單脈衝，下穿超買線是空單脈衝，其餘為 0。"
+            "成交、限價留存、止損、止盈和手續費在 ymzz.hf，不在一般市價引擎。"
+            "紙上預設是現貨 1 倍、名義 10 美元。空單只記在紙上帳，不向交易所借幣。"
+        ),
+        source_zh="Wilder（1978）平滑 RSI。觸發和限價成交是本倉庫寫明的規則。",
+        decision_indicators=["rsi"],
+        display_indicators=["rsi"],
+        params=[
+            _p("period", "RSI 週期", 14, 2, 100, type_="int"),
+            _p("oversold", "超賣線", 30, 1, 49),
+            _p("overbought", "超買線", 70, 51, 99),
+        ],
+    ),
 }
 
 
@@ -414,22 +432,52 @@ def compute_signals(strategy_id: str, closes: list[float], params: dict | None, 
         dif, dea, hist = macd(close, fast, slow, signal_p)
         entry = np.zeros(len(close))
         ind_exit = np.zeros(len(close))
-        for i in range(1, len(close)):
-            if not (_finite_pair(dif, dea, i) and np.isfinite(line[i])):
-                continue
-            golden = dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]
-            death = dif[i - 1] >= dea[i - 1] and dif[i] < dea[i]
-            if golden and low <= float(line[i]) <= high:
-                entry[i] = 1.0
-            if death or float(line[i]) > exit_level:
-                ind_exit[i] = 1.0
-        signals = entry
+        if not allow_short:
+            for i in range(1, len(close)):
+                if not (_finite_pair(dif, dea, i) and np.isfinite(line[i])):
+                    continue
+                golden = dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]
+                death = dif[i - 1] >= dea[i - 1] and dif[i] < dea[i]
+                if golden and low <= float(line[i]) <= high:
+                    entry[i] = 1.0
+                if death or float(line[i]) > exit_level:
+                    ind_exit[i] = 1.0
+            signals = entry
+            indicators["_indicator_exit"] = [float(v) for v in ind_exit]
+            warnings.append("RSI+MACD 的進場是單根脈衝，持倉直到止盈、止損或指標出場，不是每根都重算目標曝險。")
+        else:
+            pos = 0.0
+            mirror_exit = 100.0 - exit_level
+            for i in range(1, len(close)):
+                if not (_finite_pair(dif, dea, i) and np.isfinite(line[i])):
+                    entry[i] = pos
+                    continue
+                golden = dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]
+                death = dif[i - 1] >= dea[i - 1] and dif[i] < dea[i]
+                rsi_now = float(line[i])
+                if golden and low <= rsi_now <= high:
+                    pos = 1.0
+                elif death and low <= rsi_now <= high:
+                    pos = -1.0
+                elif pos > 0 and (death or rsi_now > exit_level):
+                    pos = 0.0
+                elif pos < 0 and (golden or rsi_now < mirror_exit):
+                    pos = 0.0
+                entry[i] = pos
+            signals = entry
+            warnings.append("允許做空時，RSI+MACD 改成持倉狀態：死叉且 RSI 落在同一進場區間才放空。現貨引擎仍會把空單改成平倉，不會借幣。")
         indicators["rsi"] = _nan_list(line)
         indicators["dif"] = _nan_list(dif)
         indicators["dea"] = _nan_list(dea)
         indicators["macd_hist"] = _nan_list(hist)
-        indicators["_indicator_exit"] = [float(v) for v in ind_exit]
-        warnings.append("RSI+MACD 的進場是單根脈衝，持倉直到止盈、止損或指標出場，不是每根都重算目標曝險。")
+    elif strategy_id == "hf_trigger":
+        from ymzz.hf import trigger_signals
+
+        period = int(resolved["period"])
+        low, high = resolved["oversold"], resolved["overbought"]
+        signals = trigger_signals(close, period, low, high)
+        indicators["rsi"] = _nan_list(rsi(close, period))
+        warnings.append("高頻觸發的限價、止損和止盈由 ymzz.hf 成交。這條訊號不是市價引擎的持倉目標。")
     else:
         raise ConfigError(f"沒有這個策略：{strategy_id}")
 

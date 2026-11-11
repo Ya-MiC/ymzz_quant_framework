@@ -151,11 +151,10 @@ USDC 在 Polygon 與 Arbitrum 上各有 USDC.e 和 native USDC。轉出錢包用
 
 <https://support.kraken.com/articles/kraken-markets>（Last updated: October 30, 2026）
 
-紙上與實盤下單仍只接受 BTC/USD。`src/ymzz/paper.py` 的 `kraken_pair()` 只放行 `BTCUSD`／`XBTUSD`。回測指令另外接受 `ETH/USD` 與 `SOL/USD`，那兩對沒有接到紙上或實盤下單。因此：
+紙上與實盤現貨現在接受 BTC、ETH、SOL 的 USD 與 USDC。`kraken_pair()` 會把 `BTC/USDC` 對到 `XBTUSDC`。實盤仍拒絕超過單筆上限的單，也拒絕現貨槓桿和沒有止損的買單。因此：
 
-- 帳戶裡需要 USD，再由程式去交易 XBT/USD。
-- 你若只持有 USDC，**不要**把命令改成 `--symbol BTC/USDC`。公開 API 看得到 `XBT/USDC`，這支 CLI 仍會拒絕。
-- 持有 USDC 時，在 Kraken 把 USDC 賣成 USD。`USDC/USD` 的 `ordermin` 在 2026-11-11 是 5，大約 10 USDC 高於這個數量下限，`costmin` 是 0.5。是否能下這張單，仍看你的帳戶是否看得到該交易對，以及 5 美元的現金訂單最低額。
+- USD 用 `--symbol BTC/USD`（ETH/USD、SOL/USD 同樣）。USDC 用 `--symbol BTC/USDC`（ETH/USDC、SOL/USDC 同樣）。`BTC/USDC` 會送到 `XBTUSDC`。
+- 若仍要把 USDC 換成 USD 再交易，`USDC/USD` 的 `ordermin` 在 2026-11-11 是 5，大約 10 USDC 高於這個數量下限，`costmin` 是 0.5。是否能下這張單，仍看你的帳戶是否看得到該交易對，以及 5 美元的現金訂單最低額。
 - Kraken Pro 賣出步驟：<https://support.kraken.com/articles/how-to-buy-and-sell-on-kraken-pro>。在 Trade 分頁左上角的市場選擇器選交易對（該文的例子是 BTC/USD；賣 USDC 時選 USDC/USD，若你的清單裡沒有這一對，就停在官方市場頁，不要改走別的幣）。Sell 是賣出基礎貨幣、收到報價貨幣。市價單只填數量，按該文說的大顆買賣按鈕送出。市價單一定收 taker 費。
 - App 的 Convert：<https://support.kraken.com/articles/360058727972-buying-selling-and-converting-cryptocurrency-with-the-kraken-app>。該文寫 Convert 的現金會進你在 App 裡設定的預設法幣。要收到 USD，就先把預設法幣改成 USD。本教程沒有核對「改預設法幣」的按鈕文字，改法幣時見該篇與帳戶設定。
 

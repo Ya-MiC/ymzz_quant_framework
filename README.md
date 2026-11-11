@@ -50,6 +50,15 @@ PYTHONPATH=src python -m ymzz.cli paper \
 
 狀態在 `data/paper/state.json`，決策會附加到旁邊的 CSV 與 Markdown。若本機有 `kraken` 執行檔（krakenfx/kraken-cli，MIT），紙上單交給 `kraken paper buy`／`sell`／`status`。沒有這個執行檔時，紙上單改在純 Python 裡用 Kraken 公開最後成交價成交，手續費與滑點沿用 `--fee-bp`、`--slip-bp`。實盤單仍然要 `kraken` 執行檔，不會用模擬成交代替。
 
+一個月的高頻規則是固定觸發，執行時不再挑參數：
+
+```bash
+PYTHONPATH=src python -m ymzz.cli paper --preset hf
+PYTHONPATH=src python -m ymzz.cli run --preset hf --once
+```
+
+它跑 BTC/USD 的 1 小時現貨，名義 10 美元，進場就附止損和止盈。`--live` 會拒絕。2026-11-11 的 30 日樣本外是虧的，數字在 [一個月高頻觸發](docs/1111_1608_seoul_一個月高頻觸發.md)。
+
 `--live` 預設拒絕。要送實盤必須同時有環境變數 `KRAKEN_API_KEY`、`KRAKEN_API_SECRET` 和 `--i-confirm-live`。硬上限是本金不超過 10 美元、現貨 1 倍、買單一定附止損。程式不會印出密鑰。這份倉庫的測試沒有、也不會打實盤。入金、權限與交鑰步驟見 [Kraken 入金與 API 設定教程](docs/kraken_入金與API設定教程.md)。
 
 紙上訊號機器人：
@@ -170,8 +179,8 @@ ssh -L 8787:127.0.0.1:8787 user@server
 | 市場 | 來源 | 說明 |
 | --- | --- | --- |
 | A 股日線 | 新浪、騰訊前復權、東財 `fqt=1` | 只有日線。新浪沒有復權參數，不稱作前復權。騰訊與東財的量是手，程式乘 100 成股。東財主機要明示，預設 `80.push2his.eastmoney.com`，不會輪詢。 |
-| BTC 現貨 | OKX、幣安、Kraken `BTC/USD`，另有可選 ccxt | OKX 日線切在 UTC+8。幣安與 Kraken 切在 UTC。Kraken 公開 OHLC 大約 720 根，未收盤與 `last` 之後的 K 線會剔除。回測另接受 `ETH/USD` 與 `SOL/USD`；紙上與實盤下單仍只做 BTC/USD。不要混著比訊號。ccxt 要另裝，並在請求帶 `ccxt_exchange`，不會改走那三個既有解析。 |
-| BTC 永續 | OKX、幣安 | 必須同時拿到資金費，而且幣安會帶 `startTime`／`endTime` 逐頁補齊。Kraken 這版沒有永續。ccxt 不接永續。 |
+| BTC 現貨 | OKX、幣安、Kraken `BTC/USD`，另有可選 ccxt | OKX 日線切在 UTC+8。幣安與 Kraken 切在 UTC。Kraken 公開 OHLC 大約 720 根，未收盤與 `last` 之後的 K 線會剔除。回測、紙上與實盤現貨接受 BTC、ETH、SOL 的 USD 或 USDC。單筆保證金上限 10 美元，名義上限 20 美元；現貨 1 倍所以名義就是 10。空單和 2 倍只在永續回測裡，實盤不送。不要混著比訊號。ccxt 要另裝，並在請求帶 `ccxt_exchange`，不會改走那三個既有解析。 |
+| BTC 永續 | OKX、幣安 | 必須同時拿到資金費，而且幣安會帶 `startTime`／`endTime` 逐頁補齊。目錄裡的永續下單不接 Kraken。高頻研究另外讀 Kraken 線性永續的公開 K 線與資金費，不從這裡送實盤。ccxt 不接永續。 |
 | Solana 池 | GeckoTerminal 日線與 15 分 | 熱門池有生存者偏差。預設 30bp 是假設的池費。 |
 | Polymarket | 預設 Gamma + CLOB `prices-history` | 用 token id。歷史是價格點。HTTP 451 或空陣列就停止，不用現價編歷史。`adapter=sdk` 會試官方 `polymarket-client`（MIT，beta）；沒裝就退回 httpx。 |
 | Stock App 打金狗 | 無 | 產品還沒被指認。不接 yfinance，也不用 A 股或 GMGN 頂替。 |

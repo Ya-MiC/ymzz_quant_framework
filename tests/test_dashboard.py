@@ -302,6 +302,43 @@ def test_sweep_view_serves_summary_then_one_curve(tmp_path):
     assert empty.get("/api/dashboard/sweep").json()["rows"] == []
 
 
+def test_hf_month_view_lists_oos_without_the_curve(tmp_path):
+    payload = {
+        "headline_id": "main",
+        "recommendation": {"id": "main", "reason_zh": "樣本外是虧的"},
+        "selected_on_train": {"period": 14},
+        "coverage": [{"venue": "perp PF_XBTUSD", "timeframe": "1h", "n": 10, "first": "2026-08-19", "last": "2026-11-11", "days": 83, "note_zh": "永續"}],
+        "rows": [
+            {
+                "id": "main",
+                "name": "永續1小時",
+                "fee_label": "40/80",
+                "total_return": -0.02,
+                "max_drawdown": 0.04,
+                "round_trips": 8,
+                "win_rate": 0.25,
+                "fees_paid": 1.2,
+                "final_equity": 9.8,
+                "equity": [{"time": "2026-10-12", "equity": 10}],
+                "trades": [],
+            }
+        ],
+    }
+    (tmp_path / "results").mkdir()
+    (tmp_path / "results" / "hf_month.json").write_text(json.dumps(payload), encoding="utf-8")
+    client = TestClient(create_dashboard_app(tmp_path))
+    summary = client.get("/api/dashboard/slots").json()
+    assert summary["ok"] is True
+    assert "equity" not in summary["rows"][0]
+    assert summary["rows"][0]["fees_paid"] == 1.2
+    curve = client.get("/api/dashboard/slots", params={"id": "aggregate"}).json()
+    assert curve["aggregate"]["equity"][0]["equity"] == 10
+    page = client.get("/").text
+    assert "一個月高頻" in page
+    empty = TestClient(create_dashboard_app(tmp_path / "missing"))
+    assert empty.get("/api/dashboard/slots").json()["rows"] == []
+
+
 def test_public_address_and_balance_parser():
     assert validate_public_address(ADDRESS) == ADDRESS
     with pytest.raises(WalletError):
